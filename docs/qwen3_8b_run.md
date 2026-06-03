@@ -109,37 +109,40 @@ algorithmic side:
 
 | paper / `rl.sh` | self-contained | what it is |
 |---|---|---|
-| `--n-samples-per-prompt 4` | `--group-size 4` | samples per prompt for the group baseline |
 | `--advantage-estimator grpo` | per-prompt mean/std normalisation | group-relative advantage |
 | `--use-kl-loss --kl-loss-coef 0.01` | `--kl-beta 0.01`, k3 estimator | KL penalty against reference |
-| `--lr 1e-6 constant` | `--lr 1e-6` no decay | actor learning rate |
 | `--rollout-max-response-len 150` | `--max-new-tokens 150` | response cap |
 | clipped surrogate (PPO-style) | `--clip-eps 0.2` + min(ratio·A, clip(ratio,1±ε)·A) | importance-ratio clip |
 | FAILED extraction → `-2.0` | `-2.0` for missing `<explanation>` | reward floor matches `nla/reward.py` |
 
-### Deviations (memory / single-GPU constraint)
+> Run-specific hyperparameters (LR, group size, LoRA rank, AR critic) differ
+> between the two runs — see the comparison table below.
 
-1. **LoRA actor (r=16) instead of full 8B fine-tune.** Paper does full FT on
-   2× H100. We allocate 1× H200 here. Trainable params: 15.3M (0.19% of
-   total). The reference policy is the same model with the LoRA adapter
-   disabled via `peft`'s `disable_adapter()` context manager — no separate
-   model copy, no weight-sync.
+### Two configs: `overnight` (250-step) vs `long` (1500-step)
 
-2. **Frozen AR critic instead of co-trained.** Paper co-trains the AR
-   alongside the actor so the reward model adapts to the new actor
-   distribution. Frozen AR is safer for a short run but risks the actor
-   finding adversarial explanations the static critic decodes well. We
-   mitigate with (a) a short run (~250 steps), and (b) a tighter KL leash
-   relative to a co-trained-AR setup.
+The repo ships two GRPO runs. The **overnight** run (`sbatch_rl_overnight.sh`)
+trades paper-fidelity for speed on 1× H200; the **long** run
+(`sbatch_rl_long.sh`) moves several knobs back toward the paper. The post-RL
+eval reported below is the **overnight** run.
 
-3. **Smaller effective batch.** Paper: 128 prompts × 4 samples = 512 / step.
-   Ours: 8 × 4 = 32 / step. More noise per step but quicker to iterate.
+| knob | overnight (250-step) | long (1500-step) | paper / `rl.sh` |
+|---|---|---|---|
+| actor LR | `1e-6` | `1e-5` | `1e-6` constant |
+| LoRA actor | r=16, α=32 | r=128, α=16, **rsLoRA** | full 8B FT |
+| AR critic | **frozen** | **co-trained** (`--train-critic`, critic-lr 5e-5) | co-trained |
+| effective batch | 8×4 = 32 / step | 16×16 = 256 / step | 128×4 = 512 / step |
 
-4. **HF `generate()` for rollout instead of SGLang `input_embeds`.** Paper's
-   `rl.sh` uses a forked SGLang server for high-throughput batched rollout
-   with injection. We use plain `transformers` `generate()` with the Karvonen
-   hook registered on layer 1. ~5× slower per step but no infra to wire up,
-   no off-policy weight-sync drift.
+Deviations from the paper common to **both** runs (memory / single-GPU constraint):
+
+1. **LoRA actor instead of full 8B fine-tune.** Paper does full FT on 2× H100;
+   we have 1× H200. The reference policy is the same model with the LoRA adapter
+   disabled via `peft`'s `disable_adapter()` context manager — no separate copy,
+   no weight-sync.
+
+2. **HF `generate()` for rollout instead of SGLang `input_embeds`.** Paper's
+   `rl.sh` uses a forked SGLang server for batched rollout with injection. We use
+   plain `transformers` `generate()` with the Karvonen hook on layer 1. ~5× slower
+   per step but no infra to wire up, no off-policy weight-sync drift.
 
 ## What went wrong + the fixes
 
