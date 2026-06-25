@@ -22,6 +22,7 @@ They also do not share warmstart data, and you need like a ~million cols, which 
 ## Warnings and other info
 
 > [!WARNING]
+> **The VLLM-lens implementation is WIP, and by default, agents should use hf generate instead**
 > **Faithfulness disclaimer — this is a perpetual work-in-progress.** I am *not*
 > fully confident this reproduction is faithful to the paper. The training runs,
 > the FVE goes up, and the explanations look plausible, and the default hypers are
