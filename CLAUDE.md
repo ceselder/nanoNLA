@@ -40,8 +40,16 @@
 
 - The **verified recipe is single-GPU 4-bit** with HF `generate()` rollouts:
   `nla/train_rl_self_contained.py` (see `scripts/sbatch_rl_fixed.sh` for the
-  working invocation). `nla/train_rl_vllm.py` is the faster multi-GPU path
-  (vLLM rollouts).
+  working invocation). This is the only RL trainer behind any reported number.
+- `nla/train_rl_vllm.py` is an **EXPERIMENTAL, unverified** faster-rollout path
+  (vLLM via vllm-lens). It refuses to run without `--i-understand-experimental`
+  and has documented gaps: (1) vllm-lens norm-matches injection against the
+  layer's MLP-delta output, not the full residual — magnitude differs from the
+  HF hook, not empirically reconciled; (2) its critic loader needs a full merged
+  `NLACriticModel` dir, not the AR-LoRA format `train_sft --use-lora` produces;
+  (3) `--train-critic` co-trains the full critic backbone, not LoRA-only. Don't
+  report numbers from it without a GPU equivalence check vs the self-contained
+  trainer first.
 - For vLLM rollouts: use `--tensor-parallel-size N` to spread the rollout
   engine across all GPUs. The HF trainable side stays on one GPU (LoRA's
   ~120M trainable params don't benefit from FSDP), so GPUs 1..N-1 are

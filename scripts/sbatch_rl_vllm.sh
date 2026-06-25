@@ -47,7 +47,10 @@ DATA=/workspace-vast/celeste/nla-data/qwen3_8b_finefineweb_100k
 
 cd /workspace-vast/celeste/nla-experiments
 
+# EXPERIMENTAL vLLM-rollout path (unverified — see nla/train_rl_vllm.py docstring).
+# The verified recipe is scripts/sbatch_rl_fixed.sh (HF-generate, single GPU 4-bit).
 python -m nla.train_rl_vllm \
+  --i-understand-experimental \
   --av-ckpt /workspace-vast/celeste/nla-ckpts/qwen3_8b_L24_av_sft_karvonen/iter_0001000/hf \
   --ar-ckpt /workspace-vast/celeste/nla-ckpts/qwen3_8b_L24_ar_sft_safe/iter_0001000/hf \
   --rl-parquet $DATA/rl_shuf.parquet \

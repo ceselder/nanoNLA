@@ -67,6 +67,20 @@ Stage 0 (extraction) is the **only model-specific step** — it forward-hooks
 Smoke-test extraction cheaply with `--stages 0,1` (skips the paid API
 explanations); a few dozen docs is enough to confirm the dims are right.
 
+> **Using the published dataset?** The HF release
+> ([ceselder/qwen3-8b-nla-L24-finefineweb-100k](https://huggingface.co/datasets/ceselder/qwen3-8b-nla-L24-finefineweb-100k))
+> ships **slim** — text + provenance, **no `activation_vector` column** (the
+> vectors are deterministic given text+layer, so they're regenerated rather than
+> stored). The trainers below require that column, so first re-add it:
+> ```bash
+> python tools/regenerate_activations.py \
+>   --in av_sft_shuf.parquet --out av_sft_shuf.full.parquet \
+>   --base-model Qwen/Qwen3-8B --max-length 4096
+> ```
+> (repeat for ar_sft / rl) and point `--parquet` at the `.full.parquet`. Only
+> needed for the published slim release — your own `run_pipeline` output already
+> has the column.
+
 ## 2 · AV SFT — verbalizer (activation → text)
 
 `nla/train_sft.py --mode av` loads the base model (4-bit + LoRA by default for

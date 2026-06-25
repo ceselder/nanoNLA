@@ -1,5 +1,30 @@
 """NLA GRPO with vLLM rollouts (TRL/prime-rl-style weight broadcast + TIS).
 
+╔══════════════════════════════════════════════════════════════════════════╗
+║ ⚠️  EXPERIMENTAL / UNVERIFIED — NOT the recipe behind any reported number.  ║
+║                                                                            ║
+║ The verified pipeline is the single-GPU 4-bit HF-generate trainer          ║
+║ `nla/train_rl_self_contained.py` (see scripts/sbatch_rl_fixed.sh). This    ║
+║ vLLM path is a faster-rollout EXPERIMENT that has NOT been validated        ║
+║ end-to-end against it. Known gaps (as of 2026-06, see the audit notes):    ║
+║                                                                            ║
+║  1. vllm-lens norm-matches the injection against the decoder layer's       ║
+║     OUTPUT tensor, which for Qwen3 in vLLM is the MLP delta, not the full  ║
+║     residual stream — so the injected magnitude differs from the HF-side   ║
+║     Karvonen hook. NOT empirically reconciled. Run an HF-vs-vLLM greedy    ║
+║     equivalence check on a GPU before trusting any number from this path.  ║
+║  2. The critic loader expects a FULL (merged, bf16) NLACriticModel dir     ║
+║     with value_head.safetensors — it does NOT read the AR-LoRA format      ║
+║     (ar_lora_value_head.safetensors + ar_meta.json) that `train_sft        ║
+║     --use-lora` actually produces. Point --ar-ckpt at a merged critic.     ║
+║  3. --train-critic co-trains the FULL critic backbone here (vs LoRA-only   ║
+║     in the self-contained twin) — a much heavier, differently-behaved      ║
+║     reward-model update.                                                   ║
+║                                                                            ║
+║ Requires --i-understand-experimental to run. Use the self-contained        ║
+║ trainer for anything whose result you intend to report.                    ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
 Same skeleton as train_rl_self_contained.py, but rollout uses vLLM via
 vllm-lens's SteeringVector for ~5-10× faster batched generation. After each
 optimizer step (configurable via --vllm-sync-every) the LoRA-merged actor
@@ -624,8 +649,35 @@ def grpo_loss(
     return loss, metrics
 
 
+_EXPERIMENTAL_BANNER = r"""
+================================================================================
+  train_rl_vllm.py — EXPERIMENTAL / UNVERIFIED vLLM-rollout GRPO trainer
+================================================================================
+  This is NOT the trainer behind any reported nanoNLA number. The verified
+  recipe is nla/train_rl_self_contained.py (scripts/sbatch_rl_fixed.sh).
+
+  Unverified/divergent vs the self-contained trainer:
+    1. vllm-lens injection norm-match targets the layer's MLP-delta output,
+       not the full residual — injected magnitude differs from the HF hook.
+       Run a greedy HF-vs-vLLM equivalence check before trusting results.
+    2. Critic loader needs a FULL merged NLACriticModel dir (value_head.
+       safetensors); it does NOT read the AR-LoRA format train_sft --use-lora
+       produces. Point --ar-ckpt at a merged critic.
+    3. --train-critic co-trains the FULL critic backbone (not LoRA-only).
+
+  Proceeding because --i-understand-experimental was passed.
+================================================================================
+"""
+
+
 def main():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(
+        description="EXPERIMENTAL vLLM-rollout NLA GRPO trainer — unverified; "
+                    "use nla.train_rl_self_contained for reportable runs.")
+    p.add_argument("--i-understand-experimental", action="store_true",
+                   help="REQUIRED. Acknowledge this is the unverified vLLM path "
+                        "(see module docstring). Without it the trainer refuses "
+                        "to run and points you at train_rl_self_contained.")
     p.add_argument("--av-ckpt", required=True)
     p.add_argument("--ar-ckpt", required=True)
     p.add_argument("--rl-parquet", required=True)
@@ -698,6 +750,20 @@ def main():
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
+
+    if not args.i_understand_experimental:
+        import sys
+        sys.exit(
+            "\nREFUSING TO RUN: train_rl_vllm.py is the EXPERIMENTAL, unverified "
+            "vLLM-rollout path.\nThe verified recipe is:\n"
+            "    python -m nla.train_rl_self_contained ...  "
+            "(see scripts/sbatch_rl_fixed.sh)\n\n"
+            "If you really mean to use the vLLM path, re-run with "
+            "--i-understand-experimental\nand read the gaps in the module "
+            "docstring (injection norm-match, critic format, full-backbone "
+            "co-train).\n"
+        )
+    print(_EXPERIMENTAL_BANNER, flush=True)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -793,6 +859,19 @@ def main():
             ar_src = str(_crit_latest)
             print(f"[critic] RESUMING co-trained critic from {ar_src}")
     print(f"[critic] loading {ar_src}")
+    if not (Path(ar_src) / "value_head.safetensors").exists():
+        is_lora = (Path(ar_src) / "ar_lora_value_head.safetensors").exists()
+        import sys
+        sys.exit(
+            f"\n[critic] {ar_src} has no value_head.safetensors.\n"
+            + ("This looks like the AR-LoRA format (ar_lora_value_head.safetensors "
+               "+ ar_meta.json) from `train_sft --use-lora`, which this EXPERIMENTAL "
+               "vLLM trainer does NOT support (gap #2 in the docstring). Either "
+               "merge the critic to a full NLACriticModel dir, or use "
+               "nla.train_rl_self_contained which reads the LoRA format directly.\n"
+               if is_lora else
+               "Point --ar-ckpt at a full merged NLACriticModel directory.\n")
+        )
     critic = NLACriticModel.from_pretrained(
         ar_src, torch_dtype=torch.bfloat16,
     ).to(device)
