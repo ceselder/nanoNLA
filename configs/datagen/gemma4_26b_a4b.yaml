@@ -1,0 +1,46 @@
+# NLA datagen — Gemma-4-26B-A4B (MoE) over a pretraining-like corpus.
+# Mirrors the Qwen3-8B config but for the Gemma-4 26B-total/4B-active MoE.
+#
+# Two ways to get warmstart data for this model:
+#  (a) FROM SCRATCH: run nla.datagen.run_pipeline with this config (extracts
+#      Gemma activations + fresh Claude summaries — paid, hours).
+#  (b) REUSE (cheaper, recommended): take an existing slim release's (text,
+#      summary) pairs and only re-extract Gemma activations via
+#      scripts/gemma_warmstart_from_slim.py — no API cost. See
+#      scripts/run_gemma4_warmstart.sh.
+#
+# Arch notes (differ from Qwen3): multimodal wrapper (text decoder under
+# .model.language_model; vision tower discarded), Gemma sandwich norms,
+# embed ×√hidden_size (registered in arch_adapters), 128-expert MoE — LoRA
+# targets ATTENTION ONLY (q/k/v/o_proj); experts + router untouched.
+# Injection marker is ㊗ (single-token in Gemma-4; the Qwen ㈎ splits to 3).
+
+model: gemma4_26b_a4b
+layer_index: 20                      # ~2/3 depth of 30; middle-to-late residual
+injection_char: "㊗"                  # single-token in Gemma-4 vocab (id 249568)
+output_dir: /workspace/gemma-nla/gemma4_26b_a4b_100k
+
+corpus:
+  name: /workspace/gemma-nla/finefineweb_100k.parquet
+  config: null
+  split: train
+  text_column: text
+  start: 0
+  length: 100000
+
+stage0:
+  positions_per_doc: 10
+  chunk_size: 256
+  seed: 42
+  multigpu: false
+
+stage1:
+  av_sft_frac: 0.25
+  ar_sft_frac: 0.25
+  rl_frac: 0.50
+  seed: 42
+
+stage2:
+  model: claude-sonnet-4-6
+  max_tokens: 300
+  temperature: 1.0

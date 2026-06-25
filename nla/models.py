@@ -57,19 +57,15 @@ def _truncate_config_layers(config, num_layers: int) -> None:
 
 
 def _inner_transformer(backbone: PreTrainedModel) -> nn.Module:
-    """Get the inner transformer module (the part with .layers + .norm).
+    """Get the inner transformer module (the part with .layers + .norm, whose
+    forward returns last_hidden_state).
 
-    Qwen/Llama/Mistral/Gemma (post-resolve_text_model → CausalLM wrapper): backbone.model
-    GPT-2/Falcon: backbone.transformer
+    Uses walk_to_decoder so it handles Qwen/Llama (.model), Gemma-3/4 multimodal
+    (.model.language_model — the text decoder), and GPT-2/Falcon (.transformer).
+    The returned module both holds .layers and yields last_hidden_state.
     """
-    if hasattr(backbone, "model"):
-        return backbone.model
-    if hasattr(backbone, "transformer"):
-        return backbone.transformer
-    raise AssertionError(
-        f"{type(backbone).__name__} has neither .model nor .transformer — "
-        f"add the attribute name here if supporting a new arch"
-    )
+    from nla.arch_adapters import walk_to_decoder
+    return walk_to_decoder(backbone)
 
 
 class NLACriticModel(PreTrainedModel):
@@ -88,7 +84,10 @@ class NLACriticModel(PreTrainedModel):
     def __init__(self, config, backbone: PreTrainedModel):
         super().__init__(config)
         self.backbone = backbone
-        self.value_head = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        # hidden_size lives under .text_config for multimodal wrappers (Gemma-3/4).
+        from nla.arch_adapters import resolve_text_config
+        d_model = resolve_text_config(config).hidden_size
+        self.value_head = nn.Linear(d_model, d_model, bias=False)
         # FSDP's apply_fsdp2 reads this to decide which modules to wrap.
         # Instance attr (not class attr) — two NLACriticModels with different
         # backbones in one process would clobber each other on class attr.

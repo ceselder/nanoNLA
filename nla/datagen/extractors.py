@@ -74,6 +74,7 @@ class HFExtractor(ActivationExtractor):
         torch_dtype: torch.dtype = torch.bfloat16,
         max_length: int = 2048,
         batch_size: int = 16,
+        model_kwargs: dict | None = None,
     ):
         self.tokenizer = load_tokenizer(model_name)
         if self.tokenizer.pad_token_id is None:
@@ -84,8 +85,12 @@ class HFExtractor(ActivationExtractor):
         # — left-truncation would mean token_ids[0] is NOT the doc start.
         self.tokenizer.padding_side = "right"
         self.tokenizer.truncation_side = "right"
+        # model_kwargs lets callers pass arch-specific load flags, e.g.
+        # experts_implementation="eager" for Gemma-4 MoE on Blackwell (B200,
+        # sm_100), whose default fused torch._grouped_mm kernel is sm_90-only.
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, device_map=device_map, torch_dtype=torch_dtype
+            model_name, device_map=device_map, torch_dtype=torch_dtype,
+            **(model_kwargs or {}),
         ).eval()
         self.d_model = resolve_text_config(self.model.config).hidden_size
         self.max_length = max_length

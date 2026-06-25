@@ -73,6 +73,19 @@ MODELS: dict[str, ModelPreset] = {
         turn_marker="<start_of_turn>",
         accepts_system_role=False,
     ),
+    "gemma4_26b_a4b": ModelPreset(
+        # Gemma-4 26B-total / 4B-active MoE (128 experts, top-8). Multimodal
+        # wrapper (text decoder under .model.language_model; vision tower
+        # discarded). 30 layers → default extraction layer 20. Marker char must
+        # be ㊗ (single-token in Gemma-4's vocab; the Qwen ㈎ splits to 3 tokens).
+        # device_map="auto" spreads the 26B bf16 across the available GPUs.
+        hf_name="google/gemma-4-26B-A4B",
+        num_layers=30,
+        d_model=2816,
+        extractor_kwargs={"batch_size": 8, "max_length": 4096, "device_map": "auto"},
+        turn_marker="<start_of_turn>",
+        accepts_system_role=False,
+    ),
     "llama70b": ModelPreset(
         hf_name="meta-llama/Llama-3.3-70B-Instruct",
         num_layers=80,

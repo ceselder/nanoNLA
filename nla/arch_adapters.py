@@ -81,23 +81,47 @@ def resolve_text_model(model: Any) -> Any:
     return model
 
 
-def resolve_decoder_layers(model: Any) -> torch.nn.ModuleList:
-    """Find the decoder layers ModuleList, unwrapping multimodal wrappers first.
+def walk_to_decoder(module: Any) -> Any:
+    """Descend to the module holding the decoder-layer ModuleList (`.layers`/`.h`).
 
-    After resolve_text_model (always returns CausalLM-shaped):
-      Llama/Qwen/Mistral/Gemma: model.model.layers
-      GPT-2/Falcon: model.transformer.h
+    Follows the common container attrs: `.model` (Qwen/Llama/Mistral CausalLM →
+    inner model), `.language_model` (Gemma-3/4 multimodal wrappers nest the text
+    decoder under .model.language_model), `.transformer` (GPT-2/Falcon). Stops at
+    the first module that exposes `.layers` or `.h`.
+
+    PEFT-aware: callers should pass `model.base_model` for PeftModels (or this
+    walk will follow .base_model too via .model). Mirrors the layer-walk in the
+    trainers' karvonen hook.
     """
-    model = resolve_text_model(model)
-    if hasattr(model, "model"):
-        layers = model.model.layers
-    elif hasattr(model, "transformer"):
-        layers = model.transformer.h
-    else:
-        raise AssertionError(
-            f"{type(model).__name__} has neither .model nor .transformer — "
-            f"extend arch_adapters.resolve_decoder_layers for this architecture"
-        )
+    target = module.base_model if hasattr(module, "base_model") and not hasattr(module, "layers") else module
+    seen = 0
+    while not (hasattr(target, "layers") or hasattr(target, "h")):
+        if hasattr(target, "model"):
+            target = target.model
+        elif hasattr(target, "language_model"):
+            target = target.language_model
+        elif hasattr(target, "transformer"):
+            target = target.transformer
+        else:
+            raise AssertionError(
+                f"could not find decoder layers walking from {type(module).__name__} "
+                f"(stuck at {type(target).__name__}) — extend walk_to_decoder"
+            )
+        seen += 1
+        if seen > 8:
+            raise AssertionError(f"walk_to_decoder exceeded depth from {type(module).__name__}")
+    return target
+
+
+def resolve_decoder_layers(model: Any) -> torch.nn.ModuleList:
+    """Find the decoder layers ModuleList, unwrapping multimodal wrappers.
+
+    Robust walk via walk_to_decoder — handles Qwen/Llama (.model.layers),
+    Gemma-3/4 multimodal (.model.language_model.layers), GPT-2/Falcon
+    (.transformer.h). HFExtractor relies on this for activation extraction.
+    """
+    inner = walk_to_decoder(model)
+    layers = inner.layers if hasattr(inner, "layers") else inner.h
     assert isinstance(layers, torch.nn.ModuleList), (
         f"resolved {type(layers).__name__}, expected nn.ModuleList. "
         f"Module path is wrong for {type(model).__name__}."
@@ -111,6 +135,24 @@ def is_multimodal_wrapper(config_or_model: Any) -> bool:
         if getattr(config_or_model, attr, None) is not None:
             return True
     return False
+
+
+_ATTN_PROJ = ("q_proj", "k_proj", "v_proj", "o_proj")
+
+
+def lora_attention_targets(config_or_model: Any):
+    """PEFT `target_modules` for attention LoRA, vision-tower-safe.
+
+    Plain text models (Qwen/Llama): the bare suffix list — matches every
+    decoder attention projection. Multimodal wrappers (Gemma-3/4): a regex
+    scoped to the `language_model` subtree, so the vision tower's
+    identically-named q/k/v/o_proj do NOT get adapters (they'd be dead weight
+    and bloat the saved adapter). PEFT treats a str target_modules as a regex
+    fullmatched against each module's qualified name.
+    """
+    if is_multimodal_wrapper(config_or_model):
+        return r".*language_model\..*\.(q_proj|k_proj|v_proj|o_proj)"
+    return list(_ATTN_PROJ)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -132,6 +174,8 @@ def is_multimodal_wrapper(config_or_model: Any) -> bool:
 # model_type → scale expression. √d_model is the common case; if an arch
 # uses a different formula, add a lambda here.
 _SCALED_EMBED_MODEL_TYPES: dict[str, str] = {
+    "gemma4": "sqrt_d_model",
+    "gemma4_text": "sqrt_d_model",
     "gemma3": "sqrt_d_model",
     "gemma3_text": "sqrt_d_model",
     "gemma2": "sqrt_d_model",

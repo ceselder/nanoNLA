@@ -37,6 +37,7 @@ import wandb
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
+from nla.arch_adapters import lora_attention_targets
 from nla.config import load_nla_config
 from nla.injection import karvonen_inject_in_residual
 from nla.models import NLACriticModel
@@ -106,8 +107,21 @@ def _register_karvonen_hook(model, vectors_ref, inj_id, left_id, right_id, layer
     model.get_input_embeddings().register_forward_hook(embed_hook, with_kwargs=True)
     # PEFT-aware: under get_peft_model the layers live below .base_model.
     target = model.base_model if hasattr(model, "base_model") else model
-    while hasattr(target, "model") and not hasattr(target, "layers"):
-        target = target.model
+    # Walk to the decoder stack. Follows .model (Qwen/Llama) AND .language_model
+    # (Gemma-3/4 multimodal wrappers nest the text decoder under
+    # .model.language_model). Stops at the module that actually holds .layers.
+    while not hasattr(target, "layers"):
+        if hasattr(target, "model"):
+            target = target.model
+        elif hasattr(target, "language_model"):
+            target = target.language_model
+        elif hasattr(target, "transformer"):
+            target = target.transformer
+        else:
+            raise AssertionError(
+                f"could not find .layers walking from {type(target).__name__}; "
+                f"extend the karvonen-hook layer walk for this architecture"
+            )
     target.layers[layer_idx].register_forward_hook(layer_hook)
 
 
@@ -262,8 +276,16 @@ def _resolve_device_map(device_map_mode, max_gpu_mem, quant_config):
     return {"": 0}, None
 
 
+def _experts_kw(args):
+    """from_pretrained kwargs for MoE experts kernel selection (Gemma-4 on
+    Blackwell needs experts_implementation='eager'; empty for non-MoE)."""
+    ei = getattr(args, "experts_implementation", None)
+    return {"experts_implementation": ei} if ei else {}
+
+
 def init_critic_from_base(base_ckpt: str, num_layers: int, dtype, quant_config=None,
-                          device_map=None, max_memory=None, strip_final_norm=True):
+                          device_map=None, max_memory=None, strip_final_norm=True,
+                          experts_implementation=None):
     """Truncate base to first `num_layers` transformer blocks, attach an
     identity-init Linear(d, d) value_head. NLACriticModel handles the wrapping.
 
@@ -282,15 +304,18 @@ def init_critic_from_base(base_ckpt: str, num_layers: int, dtype, quant_config=N
         base_ckpt, torch_dtype=dtype, attn_implementation="sdpa",
         quantization_config=quant_config,
         device_map=device_map, max_memory=max_memory,
+        **({"experts_implementation": experts_implementation} if experts_implementation else {}),
     )
+    from nla.arch_adapters import resolve_text_config, walk_to_decoder
     cfg = deepcopy(base.config)
-    cfg.num_hidden_layers = num_layers
-    if hasattr(cfg, "layer_types") and cfg.layer_types is not None:
-        cfg.layer_types = list(cfg.layer_types)[:num_layers]
-    # Walk into the inner module to get .layers
-    inner = base
-    while hasattr(inner, "model") and not hasattr(inner, "layers"):
-        inner = inner.model
+    # num_hidden_layers / layer_types / hidden_size live under .text_config for
+    # multimodal wrappers (Gemma-3/4); resolve_text_config returns the right one.
+    cfg_text = resolve_text_config(cfg)
+    cfg_text.num_hidden_layers = num_layers
+    if getattr(cfg_text, "layer_types", None) is not None:
+        cfg_text.layer_types = list(cfg_text.layer_types)[:num_layers]
+    # Walk to the text decoder (handles .model.language_model nesting for Gemma).
+    inner = walk_to_decoder(base)
     # Keep only the first num_layers blocks
     inner.layers = torch.nn.ModuleList(list(inner.layers)[:num_layers])
     # Truncate the BACKBONE's own config too — NLACriticModel.save_pretrained
@@ -298,9 +323,10 @@ def init_critic_from_base(base_ckpt: str, num_layers: int, dtype, quant_config=N
     # Leaving it at the full depth makes a full (non-LoRA) AR save claim 36
     # layers with weights for 25; a later from_pretrained would then randomly
     # initialize the missing blocks and silently predict garbage.
-    base.config.num_hidden_layers = num_layers
-    if getattr(base.config, "layer_types", None) is not None:
-        base.config.layer_types = list(base.config.layer_types)[:num_layers]
+    base_text_cfg = resolve_text_config(base.config)
+    base_text_cfg.num_hidden_layers = num_layers
+    if getattr(base_text_cfg, "layer_types", None) is not None:
+        base_text_cfg.layer_types = list(base_text_cfg.layer_types)[:num_layers]
     if strip_final_norm:
         # RAW residual stream → value head. The full model's final
         # RMSNorm was trained for the LAST layer's output; applying it to the
@@ -319,7 +345,7 @@ def init_critic_from_base(base_ckpt: str, num_layers: int, dtype, quant_config=N
     # lm_head is never used by the critic — drop it (frees ~1.2GB on 8B-class).
     if hasattr(base, "lm_head"):
         base.lm_head = torch.nn.Identity()
-    d_model = cfg.hidden_size
+    d_model = cfg_text.hidden_size
     # NLACriticModel wraps backbone + value_head. Constructor takes both.
     critic = NLACriticModel(cfg, base)
     # Identity init the value head (Linear has bias=False per models.py:82)
@@ -491,6 +517,9 @@ def main():
                    default=None,
                    help="Default: ON for AV (fits 8B + batch=64 + FA2 on 141 GB H200), "
                         "OFF for AR (smaller model + shorter seq fits comfortably).")
+    p.add_argument("--experts-implementation", default=None,
+                   help="MoE experts kernel (Gemma-4 etc.): 'eager' to avoid the "
+                        "fused torch._grouped_mm (sm_90-only) on Blackwell/B200.")
     p.add_argument("--attn-implementation", default="sdpa",
                    choices=["sdpa", "flash_attention_2", "eager"])
     p.add_argument("--quant", choices=["none", "4bit"], default="none",
@@ -551,6 +580,7 @@ def main():
             attn_implementation=args.attn_implementation,
             quantization_config=quant_config,
             device_map=dmap, max_memory=max_mem,
+            **_experts_kw(args),
         )
         if dmap is None:
             model = model.to(device)
@@ -565,7 +595,8 @@ def main():
             model = get_peft_model(model, LoraConfig(
                 r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0,
                 bias="none", task_type="CAUSAL_LM", use_rslora=True,
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                # vision-tower-safe: scoped to language_model for multimodal (Gemma)
+                target_modules=lora_attention_targets(model.config),
             ))
             model.print_trainable_parameters()
         vectors_ref = [None]
@@ -615,6 +646,7 @@ def main():
                 args.base_ckpt, args.ar_num_layers, dtype, quant_config,
                 device_map=dmap, max_memory=max_mem,
                 strip_final_norm=args.strip_final_norm,
+                experts_implementation=args.experts_implementation,
             )
             if dmap is None:
                 model = model.to(device)
@@ -631,7 +663,8 @@ def main():
             inject_adapter_in_model(LoraConfig(
                 r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0,
                 bias="none", task_type="CAUSAL_LM", use_rslora=True,
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                # vision-tower-safe: scoped to language_model for multimodal (Gemma)
+                target_modules=lora_attention_targets(model.backbone.config),
             ), model.backbone)
             # Train ONLY the LoRA adapters + the value_head; freeze the rest.
             for n_, p_ in model.named_parameters():

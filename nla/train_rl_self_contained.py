@@ -114,11 +114,22 @@ def _register_karvonen_hook(model, vectors_ref, inj_id, left_id, right_id, layer
 
     emb_handle = model.get_input_embeddings().register_forward_hook(embed_hook, with_kwargs=True)
     base = model.base_model if hasattr(model, "base_model") else model
-    # PEFT-wrapped: layers are under base_model.model.model.layers
+    # Walk to the decoder stack. Follows .model (Qwen/Llama) AND .language_model
+    # (Gemma-3/4 multimodal wrappers nest the text decoder under
+    # .model.language_model). Stops at the module that actually holds .layers.
     target = base
-    while hasattr(target, "model") and not hasattr(target, "layers"):
-        target = target.model
-    # `target` should now be the inner module with .layers
+    while not hasattr(target, "layers"):
+        if hasattr(target, "model"):
+            target = target.model
+        elif hasattr(target, "language_model"):
+            target = target.language_model
+        elif hasattr(target, "transformer"):
+            target = target.transformer
+        else:
+            raise AssertionError(
+                f"could not find .layers walking from {type(target).__name__}; "
+                f"extend the karvonen-hook layer walk for this architecture"
+            )
     layer_handle = target.layers[layer_idx].register_forward_hook(layer_hook)
     return emb_handle, layer_handle
 
