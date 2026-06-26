@@ -69,7 +69,7 @@ $PY -m nla.train_sft --mode av --base-ckpt "$MODEL" --experts-implementation eag
   --parquet "$OUT/av_sft_gemma.parquet" --sidecar "$OUT/av_sft_gemma.parquet" \
   --save-dir "$CKPT/gemma4_av_sft_$TAG" \
   $STEP_ARG --batch-size 16 --gradient-accumulation-steps $GRAD_ACCUM --use-lora --lora-r 128 --lora-alpha 16 \
-  --lr 3e-5 --min-lr 3e-6 --lr-warmup-steps $WARMUP --save-every $SAVE \
+  --lr 3e-5 --min-lr 3e-6 --save-every $SAVE \
   --wandb-project nla-gemma4-26b --wandb-name "gemma4_av_sft_$TAG"
 
 echo "===== [4/4] AR-SFT (reconstructor, K+1=$((LAYER+1)) layers) + held-out FVE ====="
@@ -77,7 +77,7 @@ $PY -m nla.train_sft --mode ar --base-ckpt "$MODEL" --experts-implementation eag
   --parquet "$OUT/ar_sft_gemma.parquet" --sidecar "$OUT/ar_sft_gemma.parquet" \
   --save-dir "$CKPT/gemma4_ar_sft_$TAG" \
   $STEP_ARG --batch-size 16 --gradient-accumulation-steps $GRAD_ACCUM --use-lora --lora-r 128 --lora-alpha 16 \
-  --ar-num-layers $((LAYER+1)) --lr 3e-5 --min-lr 3e-6 --lr-warmup-steps $WARMUP \
+  --ar-num-layers $((LAYER+1)) --lr 3e-5 --min-lr 3e-6 \
   --save-every $SAVE \
   --heldout-parquet "$OUT/av_sft_gemma.parquet" --heldout-rows $HELDOUT_ROWS --heldout-every 50 \
   --wandb-project nla-gemma4-26b --wandb-name "gemma4_ar_sft_$TAG"

@@ -521,7 +521,9 @@ def main():
     p.add_argument("--max-len", type=int, default=1024)
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--min-lr", type=float, default=2e-6)
-    p.add_argument("--lr-warmup-steps", type=int, default=50)
+    p.add_argument("--lr-warmup-steps", type=int, default=None,
+                   help="LR warmup steps. Default: 10%% of total steps (helps the "
+                        "AR's unstable early steps). Set an int to override.")
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction,
                    default=None,
@@ -706,6 +708,14 @@ def main():
         args.num_steps = int(round(args.epochs * _spe))
         print(f"[loop] --epochs {args.epochs} → {args.num_steps} steps "
               f"({len(rows)} rows / eff_batch {_eff} = {_spe} steps/epoch)", flush=True)
+
+    # Default warmup = 10% of total steps (AV and AR). The AR's early steps are
+    # unstable (identity-init value head + raw layer-K residuals); a short
+    # warmup makes the loss/FVE spike. Computed AFTER num_steps is finalized.
+    if args.lr_warmup_steps is None:
+        args.lr_warmup_steps = max(1, int(0.1 * args.num_steps))
+        print(f"[loop] lr_warmup_steps = {args.lr_warmup_steps} (10% of "
+              f"{args.num_steps} steps)", flush=True)
     if args.mode == "ar" and cfg.critic_suffix_ids:
         # One-time suffix-anchor sanity check (the sidecar field's stated
         # purpose): the tokenized critic prompt must end with the expected
