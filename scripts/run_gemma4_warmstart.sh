@@ -31,11 +31,14 @@ else
 fi
 
 echo "===== [1/4] regen AV activations (Gemma layer $LAYER) ====="
+# Sequential, device_map=auto (model split across the visible GPUs). Reliable
+# (smoke-proven); the eager Gemma-4 MoE is memory-heavy so batch stays at 16.
 if [ -f "$OUT/av_sft_gemma.parquet" ]; then echo "  exists — skipping"; else
 $PY -m scripts.gemma_warmstart_from_slim \
   --slim "$SLIM/av_sft_shuf.parquet" --qwen-sidecar "$SLIM/av_sft_shuf.parquet.nla_meta.yaml" \
   --out "$OUT/av_sft_gemma.parquet" --mode av \
-  --base-model "$MODEL" --layer "$LAYER" --injection-char "$CHAR" --experts-implementation eager $MAXROWS_REGEN
+  --base-model "$MODEL" --layer "$LAYER" --injection-char "$CHAR" \
+  --experts-implementation eager --batch-size 16 $MAXROWS_REGEN
 fi
 
 echo "===== [2/4] regen AR activations ====="
@@ -43,7 +46,8 @@ if [ -f "$OUT/ar_sft_gemma.parquet" ]; then echo "  exists — skipping"; else
 $PY -m scripts.gemma_warmstart_from_slim \
   --slim "$SLIM/ar_sft_shuf.parquet" --qwen-sidecar "$SLIM/ar_sft_shuf.parquet.nla_meta.yaml" \
   --out "$OUT/ar_sft_gemma.parquet" --mode ar \
-  --base-model "$MODEL" --layer "$LAYER" --injection-char "$CHAR" --experts-implementation eager $MAXROWS_REGEN
+  --base-model "$MODEL" --layer "$LAYER" --injection-char "$CHAR" \
+  --experts-implementation eager --batch-size 16 $MAXROWS_REGEN
 fi
 
 echo "===== [3/4] AV-SFT (verbalizer) ====="
