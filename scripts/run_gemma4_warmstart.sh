@@ -25,12 +25,13 @@ mkdir -p "$OUT" "$CKPT"
 
 SMOKE="${1:-}"
 if [ "$SMOKE" = "smoke" ]; then
-  MAXROWS_REGEN="--max-rows 4000"; STEPS=60; WARMUP=5; SAVE=60; HELDOUT_ROWS=400; TAG=smoke
+  MAXROWS_REGEN="--max-rows 4000"; STEP_ARG="--num-steps 60"; WARMUP=5; SAVE=60; HELDOUT_ROWS=400; TAG=smoke
 else
-  # ⚠️ DON'T FORGET THIS — TRAIN ON THE FULL THING. ~247k SFT rows at batch 16
-  # ≈ 15.5k steps/epoch; 15500 ≈ one full epoch (was 1000 = ~6.5%, which also
-  # floored the cosine LR early → undersold FVE). train_sft warns if <1 epoch.
-  MAXROWS_REGEN=""; STEPS=15500; WARMUP=200; SAVE=2500; HELDOUT_ROWS=1000; TAG=v2_fullep
+  # ⚠️ DON'T FORGET THIS — TRAIN ON THE FULL THING: --epochs 1 = exactly one
+  # full pass over ALL ~247k SFT rows (train_sft computes steps from the real
+  # row count). The old --num-steps 1000 was ~6.5% of one epoch and floored
+  # the cosine LR early → undersold FVE.
+  MAXROWS_REGEN=""; STEP_ARG="--epochs 1"; WARMUP=200; SAVE=2500; HELDOUT_ROWS=1000; TAG=v2_fullep
 fi
 
 echo "===== [1/4] regen AV activations (Gemma layer $LAYER) ====="
@@ -61,7 +62,7 @@ $PY -m nla.train_sft --mode av --base-ckpt "$MODEL" --experts-implementation eag
   --no-gradient-checkpointing \
   --parquet "$OUT/av_sft_gemma.parquet" --sidecar "$OUT/av_sft_gemma.parquet" \
   --save-dir "$CKPT/gemma4_av_sft_$TAG" \
-  --num-steps $STEPS --batch-size 16 --use-lora --lora-r 128 --lora-alpha 16 \
+  $STEP_ARG --batch-size 16 --use-lora --lora-r 128 --lora-alpha 16 \
   --lr 3e-5 --min-lr 3e-6 --lr-warmup-steps $WARMUP --save-every $SAVE \
   --wandb-project nla-gemma4-26b --wandb-name "gemma4_av_sft_$TAG"
 
@@ -69,7 +70,7 @@ echo "===== [4/4] AR-SFT (reconstructor, K+1=$((LAYER+1)) layers) + held-out FVE
 $PY -m nla.train_sft --mode ar --base-ckpt "$MODEL" --experts-implementation eager \
   --parquet "$OUT/ar_sft_gemma.parquet" --sidecar "$OUT/ar_sft_gemma.parquet" \
   --save-dir "$CKPT/gemma4_ar_sft_$TAG" \
-  --num-steps $STEPS --batch-size 16 --use-lora --lora-r 128 --lora-alpha 16 \
+  $STEP_ARG --batch-size 16 --use-lora --lora-r 128 --lora-alpha 16 \
   --ar-num-layers $((LAYER+1)) --lr 3e-5 --min-lr 3e-6 --lr-warmup-steps $WARMUP \
   --save-every $SAVE \
   --heldout-parquet "$OUT/av_sft_gemma.parquet" --heldout-rows $HELDOUT_ROWS --heldout-every 50 \

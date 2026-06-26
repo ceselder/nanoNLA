@@ -488,13 +488,17 @@ def main():
     p.add_argument("--sidecar", default=None,
                    help="Sidecar source (defaults to --parquet for the dataset sidecar)")
     p.add_argument("--save-dir", required=True)
-    # ⚠️ DON'T FORGET THIS — TRAIN ON THE FULL THING. num_steps must cover at
-    # LEAST one epoch: num_steps * (batch_size * grad_accum) >= dataset rows.
-    # The warmstart datasets are ~247k rows → ~15.5k steps at batch 16. A
-    # carried-over small value (e.g. 1000) silently trains on a few % of the
-    # data AND lets the cosine LR floor early. The trainer prints a loud
-    # warning at startup if you're under one epoch — heed it.
+    # ⚠️ DON'T FORGET THIS — TRAIN ON THE FULL THING. Prefer --epochs 1 (one
+    # full pass over ALL rows; for the ~247k warmstart splits that's ~15.5k
+    # steps at batch 16). --num-steps is the raw override; if it covers < 1
+    # epoch the trainer prints a loud WARNING at startup. A carried-over small
+    # value (e.g. 1000 = ~6.5% of 247k) trains on a sliver AND floors the
+    # cosine LR early, underselling FVE.
     p.add_argument("--num-steps", type=int, default=1000)
+    p.add_argument("--epochs", type=float, default=None,
+                   help="Train for EXACTLY this many full passes over all loaded "
+                        "rows (overrides --num-steps). --epochs 1 = one epoch of "
+                        "the entire SFT dataset — the recommended warmstart budget.")
     p.add_argument("--batch-size", type=int, default=64,
                    help="Per-forward batch (= 'micro batch'). Effective batch = "
                         "batch_size × gradient_accumulation_steps.")
@@ -690,6 +694,18 @@ def main():
     print(f"[data] loading {args.parquet} (max_rows={args.max_rows})", flush=True)
     rows = load_sft_dataset(args.parquet, n_max=args.max_rows, mode=args.mode)
     print(f"[data] {len(rows)} rows", flush=True)
+
+    # --epochs overrides --num-steps to train for EXACTLY this many full passes
+    # over ALL loaded rows (steps = epochs × ceil(rows / eff_batch)), computed
+    # from the real row count so it's exact per split. DON'T FORGET: warmstart
+    # SFT should be ≥1 epoch — i.e. --epochs 1 = one pass over all ~247k rows.
+    # Set before the LR scheduler is built so the cosine spans the real horizon.
+    if args.epochs is not None:
+        _eff = args.batch_size * args.gradient_accumulation_steps
+        _spe = max(1, math.ceil(len(rows) / _eff))
+        args.num_steps = int(round(args.epochs * _spe))
+        print(f"[loop] --epochs {args.epochs} → {args.num_steps} steps "
+              f"({len(rows)} rows / eff_batch {_eff} = {_spe} steps/epoch)", flush=True)
     if args.mode == "ar" and cfg.critic_suffix_ids:
         # One-time suffix-anchor sanity check (the sidecar field's stated
         # purpose): the tokenized critic prompt must end with the expected

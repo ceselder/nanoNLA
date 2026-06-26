@@ -38,14 +38,16 @@
 
 ## SFT: TRAIN ON THE FULL THING
 
-- **⚠️ DON'T FORGET THIS — warmstart SFT (AV and AR) must train on the FULL SFT
-  dataset, ≥1 epoch.** `num_steps × (batch_size × grad_accum)` must be ≥ the
-  dataset row count. The warmstart splits are ~247k rows → **~15.5k steps at
-  batch 16** for one epoch. Do NOT carry over a small `--num-steps` (e.g. 1000):
-  that trains on only a few percent of the data AND lets the cosine LR floor
-  early, badly underselling FVE. `nla/train_sft.py` prints a loud
-  `WARNING: ... only X% of ONE epoch` at startup if you're under one epoch —
-  heed it. (Learned the hard way on Gemma-4: 1000 steps gave AR FVE 48.4%;
+- **⚠️ DON'T FORGET THIS — warmstart SFT (AV and AR) must train on EXACTLY 1
+  epoch of all ~247k rows (or more).** Pass **`--epochs 1`** to
+  `nla/train_sft.py` — it computes `steps = ceil(rows / (batch×grad_accum))`
+  from the real loaded row count, so it's one exact full pass (≈15.5k steps at
+  batch 16; the AV/AR splits differ slightly in row count, hence "compute it,
+  don't hardcode"). Do NOT carry over a small `--num-steps` (e.g. 1000 ≈ 6.5%
+  of 247k): that trains on a sliver AND floors the cosine LR early, badly
+  underselling FVE. If `--num-steps` covers < 1 epoch the trainer prints a loud
+  `WARNING: ... only X% of ONE epoch` at startup — heed it. (Learned the hard
+  way on Gemma-4: 1000 steps gave AR FVE 48.4% on a fraction of the data;
   retrained on the full epoch for the real number.)
 
 ## RL training: two trainers
