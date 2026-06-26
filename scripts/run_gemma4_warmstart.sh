@@ -33,10 +33,11 @@ else
   # the cosine LR early → undersold FVE.
   MAXROWS_REGEN=""; STEP_ARG="--epochs 1"; WARMUP=50; SAVE=250; HELDOUT_ROWS=1000; TAG=v2_fullep
 fi
-# Effective batch via grad-accum (memory-neutral). Paper used 256 for AV+AR SFT;
-# micro-batch stays 16 (eager-MoE memory), grad_accum 16 → eff batch 256, which
-# smooths the loss. With --epochs 1 the step count auto-scales (~965 for 247k).
-GRAD_ACCUM=16
+# Effective batch via grad-accum (memory-neutral; micro-batch stays 16 for the
+# eager-MoE memory). grad_accum 4 → eff batch 64, which smooths the loss vs
+# batch 16. (Paper used 256; we keep 64 by choice.) With --epochs 1 the step
+# count auto-scales (~3.9k for 247k at eff 64).
+GRAD_ACCUM=4
 [ "$SMOKE" = "smoke" ] && GRAD_ACCUM=1
 
 echo "===== [1/4] regen AV activations (Gemma layer $LAYER) ====="
