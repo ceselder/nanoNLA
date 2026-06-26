@@ -1,11 +1,11 @@
-"""NLA actor inference via SGLang input_embeds — single-file, no nla package deps.
+"""NLA actor + critic inference — single-file, local (no SGLang, no nla deps).
 
 An NLA (Natural Language Autoencoder) pair is two fine-tuned LMs that together
 map activation vectors to natural language and back:
 
   ACTOR  (activation verbalizer)  : hidden-state vector  →  text
-                                    [inject vector as a 1-token embedding
-                                     into a fixed prompt, then autoregress]
+                                    [inject the vector via the train-time
+                                     KARVONEN layer-1 ADD hook, then autoregress]
 
   CRITIC (activation reconstructor): text  →  hidden-state vector
                                     [truncated K+1-layer LM + Linear(d,d)
@@ -13,59 +13,34 @@ map activation vectors to natural language and back:
 
 The round-trip — extract → ACTOR verbalizes → CRITIC reconstructs → MSE against
 original — measures how well the verbalization captured the vector's content.
-That MSE was the RL reward signal during actor training: low MSE means the
-critic can recover the original direction from the actor's words alone.
+
+Injection is the SAME mechanism the model was trained with: a forward hook on
+the OUTPUT of layer 1 that norm-matched-ADDs the activation at the marker token
+(`karvonen_inject_in_residual`), NOT embedding replacement. So the client holds
+the full model and generates locally — it does not use an SGLang server.
 
 This file contains both halves:
-  NLAClient  — actor inference via SGLang input_embeds
+  NLAClient  — actor inference (loads the model, registers the Karvonen hook)
   NLACritic  — load critic + reconstruct + score (optional, pure torch)
 
 Ship alongside HF-format NLA actor + critic checkpoint dirs (each with
-config.json, safetensors, tokenizer files, nla_meta.yaml).
+config.json, safetensors, tokenizer files, nla_meta.yaml). A LoRA-adapter actor
+is fine too — pass base_ckpt.
 
 Dependencies:
-    uv pip install torch transformers safetensors httpx orjson pyyaml numpy
-    uv pip install "sglang[all]>=0.5.6"   # tested against 0.5.6; input_embeds
-                                          # API + --disable-radix-cache verified there
+    uv pip install torch transformers safetensors pyyaml numpy peft
     # Optional (for --parquet CLI): uv pip install pyarrow
 
-─────────────────────────────────────────────────────────────────────────────
-Launch SGLang first (same checkpoint path as NLAClient below):
-
-    python -m sglang.launch_server \\
-        --model-path ./actor_hf \\
-        --port 30000 \\
-        --disable-radix-cache \\
-        --mem-fraction-static 0.85 \\
-        --trust-remote-code
-
-  --disable-radix-cache is REQUIRED. Radix cache keys on token IDs;
-  input_embeds requests have none, so different embed sequences alias
-  to the same cache entry → silent garbage.
-
-  Gemma-3 needs HF_TOKEN set (gated repo) and benefits from
-  --context-length 512 (NLA prompts are short; default 8k wastes KV cache).
-
-  Stock sglang>=0.5.6 works out of the box. For high-throughput use (>10
-  req/s), sglang's input_embeds path has a FastAPI-validation bottleneck
-  (~155ms/req on the event loop, caps concurrency at ~2) and a long-running
-  server may hit a retract-path KV-slot crash. Upstream PRs open:
-    sgl-project/sglang#20205 (numpy IPC), #20206 (SkipValidation),
-    #20207 (bytes+shape transport — raw fp32 buffer, bypasses JSON),
-    #20376 (slice input_embeds on chunk-overflow — correctness, pull this in),
-    #14110 (retract fix).
-  The bytes+shape transport is the interesting one if you're scanning large
-  feature dictionaries — you may find JSON serialization the bottleneck.
-  None change the wire API; this client code works unchanged.
-─────────────────────────────────────────────────────────────────────────────
+Multi-GPU: device_map="auto" (default) shards the model across all visible GPUs
+(naive pipeline MP); the Karvonen hook fires on layer-1's output wherever that
+shard lives, so it is device-agnostic. Use device_map="cuda:0" to pin one GPU.
+For Gemma-4 MoE on Blackwell (B200), pass
+model_kwargs={"experts_implementation": "eager"}.
 
 Usage:
-    client = NLAClient("./actor_hf", sglang_url="http://localhost:30000")
-    text = client.generate(activation_vector)    # activation: [d_model] array
-
-    # or batched — one SGLang request per vector; SGLang's continuous batcher
-    # packs them server-side. For real throughput, fire in parallel via
-    # async httpx.
+    client = NLAClient("./actor_hf")                  # full model
+    client = NLAClient("./av_lora", base_ckpt="google/gemma-4-26B-A4B")  # LoRA
+    text = client.generate(activation_vector)         # activation: [d_model]
     texts = client.generate_batch(vectors, temperature=0.7)
 
     # custom prompt (must contain <INJECT> where the vector goes):
@@ -82,9 +57,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import httpx
 import numpy as np
-import orjson
 import torch
 import yaml
 from safetensors import safe_open
@@ -142,18 +115,12 @@ def load_nla_config(
     assert kind in ("nla_model", "nla_dataset"), f"unknown sidecar kind: {kind!r}"
     d_model = meta["d_model"] if kind == "nla_model" else meta["extraction"]["d_model"]
 
-    # injection_scale: MANDATORY (unless override passed). Actor sidecars have
-    # it; critic sidecars have null (critics don't inject). Dataset sidecars
-    # deliberately don't — it's a training hyperparameter.
+    # injection_scale: legacy/embedding-replace knob. Karvonen injection uses
+    # RAW vectors (norm-matched at layer 1), so generation never reads it —
+    # it's kept on NLAConfig only for informational parity. Absent → 0.0.
     inj_scale = meta.get("extraction", {}).get("injection_scale")
     if inj_scale is None:
-        inj_scale = injection_scale_override
-    assert inj_scale is not None, (
-        f"nla_meta.yaml at {checkpoint_dir!r} has no extraction.injection_scale "
-        f"(kind={kind!r}, role={meta.get('role')!r}). Actor checkpoints always "
-        f"have it. If this is a critic sidecar or a dataset sidecar, pass "
-        f"injection_scale_override explicitly."
-    )
+        inj_scale = injection_scale_override if injection_scale_override is not None else 0.0
 
     t = meta["tokens"]
     cfg = NLAConfig(
@@ -184,10 +151,12 @@ def load_nla_config(
     # apply_chat_template(tokenize=True) handles BOS correctly for all
     # architectures (Gemma template includes <bos>; Qwen has none).
     content = cfg.actor_prompt_template.format(injection_char=cfg.injection_char)
-    ids = tokenizer.apply_chat_template(
+    enc = tokenizer.apply_chat_template(
         [{"role": "user", "content": content}],
         tokenize=True, add_generation_prompt=True,
     )
+    # transformers v5 returns a BatchEncoding (dict-like); v4 returned list[int].
+    ids = enc["input_ids"] if hasattr(enc, "keys") else enc
     matches = [i for i, tok in enumerate(ids) if tok == cfg.injection_token_id]
     assert len(matches) == 1, (
         f"injection token appears {len(matches)}× in canonical prompt "
@@ -289,24 +258,24 @@ def normalize_activation(v: torch.Tensor, target_scale: float) -> torch.Tensor:
     return v / (norm_fp32 / target_scale).to(v.dtype)
 
 
-def inject_at_marked_positions(
-    input_ids: torch.Tensor,      # [1, T]
-    embeddings: torch.Tensor,     # [1, T, d]
-    vectors: torch.Tensor,        # [N, d]  — N=1 for single-prompt inference
+def karvonen_inject_in_residual(
+    input_ids: torch.Tensor,      # [B, T]
+    resid: torch.Tensor,          # [B, T, d] — output of the inject layer
+    vectors: torch.Tensor,        # [N, d]  — RAW activation(s), N marker sites
     inj_id: int, left_id: int, right_id: int,
 ) -> torch.Tensor:
-    """Overwrite embedding rows at valid injection positions. Clones first.
+    """Karvonen norm-matched ADD injection: h'_p = h_p + ||h_p|| * v/||v||.
 
-    Valid = token at p is inj_id AND tokens at p±1 match the sidecar neighbors.
-    The neighbor check rejects false positives from the injection char
-    appearing in pasted text / multi-turn context. Found count must equal
-    vectors.shape[0] — if it doesn't, CRASH LOUD rather than silently serve
-    ㈎-as-text.
+    THIS is the injection the models are trained with (norm-matched ADD on the
+    residual stream entering layer 2, i.e. the OUTPUT of layer index 1) — NOT
+    embedding replacement. Vectors are RAW (unnormalized); the norm-match
+    against the live residual does the scaling. Valid marker = inj_id with
+    sidecar neighbors at p±1; found count must equal vectors.shape[0] or CRASH.
     """
     seq_len = input_ids.shape[-1]
-    assert input_ids.shape == embeddings.shape[:-1]
-    assert vectors.ndim == 2 and vectors.shape[1] == embeddings.shape[-1]
-    out = embeddings.clone()
+    assert input_ids.shape == resid.shape[:-1]
+    assert vectors.ndim == 2 and vectors.shape[1] == resid.shape[-1]
+    out = resid.clone()
     vectors = vectors.to(out.device, out.dtype)
     vec_idx = 0
     for b, p in (input_ids == inj_id).nonzero().tolist():
@@ -314,7 +283,9 @@ def inject_at_marked_positions(
             continue
         if input_ids[b, p - 1] != left_id or input_ids[b, p + 1] != right_id:
             continue
-        out[b, p] = vectors[vec_idx]
+        h_p = out[b, p].clone()
+        v_unit = vectors[vec_idx] / (vectors[vec_idx].norm() + 1e-9)
+        out[b, p] = h_p + h_p.norm() * v_unit
         vec_idx += 1
     assert vec_idx == vectors.shape[0], (
         f"found {vec_idx} injection sites with correct neighbors, expected "
@@ -324,63 +295,129 @@ def inject_at_marked_positions(
     return out
 
 
+def _walk_to_decoder(module):
+    """Descend to the module holding `.layers` — follows .model / .language_model
+    (Gemma-3/4 multimodal) / .transformer. Mirrors nla.arch_adapters."""
+    target = module
+    for _ in range(8):
+        if hasattr(target, "layers"):
+            return target
+        if hasattr(target, "model"):
+            target = target.model
+        elif hasattr(target, "language_model"):
+            target = target.language_model
+        elif hasattr(target, "transformer"):
+            target = target.transformer
+        else:
+            break
+    raise AssertionError(f"could not find .layers from {type(module).__name__}")
+
+
+def register_karvonen_hook(model, vectors_ref, inj_id, left_id, right_id, layer_idx=1):
+    """Register the train-time Karvonen injection hook on `model`.
+
+    An embedding hook stashes input_ids; the layer-`layer_idx` hook ADDs the
+    norm-matched activation (from vectors_ref[0], a [N,d] tensor set per
+    forward) at the marker positions. No-op on cache steps (seq_len < 2) and
+    when no vector / no marker is present.
+    """
+    state = {"input_ids": None}
+
+    def embed_hook(module, args, kwargs, output):
+        ids = kwargs.get("input") if kwargs else None
+        if ids is None and args:
+            ids = args[0]
+        state["input_ids"] = ids
+        return output
+
+    def layer_hook(module, args, output):
+        resid, rest = (output[0], output[1:]) if isinstance(output, tuple) else (output, None)
+        ids = state["input_ids"]
+        v = vectors_ref[0]
+        if ids is None or resid.shape[1] < 2 or v is None or v.shape[0] == 0:
+            return output
+        if (ids == inj_id).sum().item() == 0:
+            return output
+        injected = karvonen_inject_in_residual(
+            ids.to(resid.device), resid, v.to(resid.device), inj_id, left_id, right_id,
+        )
+        return injected if rest is None else (injected, *rest)
+
+    model.get_input_embeddings().register_forward_hook(embed_hook, with_kwargs=True)
+    _walk_to_decoder(model).layers[layer_idx].register_forward_hook(layer_hook)
+
+
 # ─── Client ─────────────────────────────────────────────────────────────────
 
 class NLAClient:
     def __init__(
         self,
         checkpoint_dir: str | Path,
-        sglang_url: str = "http://localhost:30000",
+        base_ckpt: str | Path | None = None,
+        device_map: str = "auto",
         injection_scale_override: float | None = None,
-        device: str = "cpu",
+        dtype: torch.dtype = torch.bfloat16,
+        model_kwargs: dict | None = None,
     ):
         """
-        checkpoint_dir: HF-format dir with nla_meta.yaml.
-        sglang_url:     SGLang server root (NOT /generate — we append that).
-        injection_scale_override: only set if the sidecar is wrong/missing.
-            The model learned with the sidecar value; overriding = OOD.
-        device: embedding lookup device. CPU is fine (~100 rows per request).
+        checkpoint_dir: HF-format actor dir (full model OR a LoRA adapter dir)
+            with nla_meta.yaml. If it's a LoRA adapter, set base_ckpt.
+        base_ckpt: base model for a LoRA actor (None if checkpoint_dir is full).
+        device_map: passed to from_pretrained. "auto" shards across all visible
+            GPUs (naive MP) — the Karvonen layer-1 hook is device-agnostic, so
+            this is naturally multi-GPU; use "cuda:0" to pin to one GPU.
+        injection_scale_override: legacy sidecar knob; Karvonen injection uses
+            RAW vectors (norm-matched at the layer), so this is unused for
+            generation and kept only so old sidecars load.
+        model_kwargs: extra from_pretrained kwargs, e.g.
+            {"experts_implementation": "eager"} for Gemma-4 MoE on Blackwell.
+
+        NOTE: this injects via the train-time Karvonen layer-1 ADD (a forward
+        hook on the live model), NOT embedding replacement — so it must hold
+        the full model, not just the embedding, and does not use SGLang.
         """
         checkpoint_dir = Path(checkpoint_dir)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            str(checkpoint_dir), trust_remote_code=True
-        )
-        # Pass override INTO load_nla_config so its assert doesn't fire on
-        # critic/dataset sidecars that legitimately have injection_scale=null.
+        tok_src = str(base_ckpt) if base_ckpt is not None else str(checkpoint_dir)
+        self.tokenizer = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
         self.cfg = load_nla_config(
             checkpoint_dir, self.tokenizer,
             injection_scale_override=injection_scale_override,
         )
 
-        # bf16 storage: ~300MB (Qwen7B) / ~1GB (Gemma12B). Per-request
-        # fp32 cast happens only on the ~100 looked-up rows — trivial.
-        self.embed = load_embedding_only(checkpoint_dir, dtype=torch.bfloat16).to(device)
-        self.embed_scale = resolve_embed_scale(checkpoint_dir)
-
-        assert self.embed.weight.shape[1] == self.cfg.d_model, (
-            f"embedding d={self.embed.weight.shape[1]} != sidecar "
-            f"d_model={self.cfg.d_model}. Wrong checkpoint for this sidecar."
+        load_src = str(base_ckpt) if base_ckpt is not None else str(checkpoint_dir)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            load_src, torch_dtype=dtype, device_map=device_map,
+            trust_remote_code=True, **(model_kwargs or {}),
         )
+        if base_ckpt is not None:
+            # LoRA actor: attach the trained adapter onto the base.
+            from peft import PeftModel
+            self.model = PeftModel.from_pretrained(self.model, str(checkpoint_dir))
+        self.model.eval()
 
-        self.sglang_url = sglang_url.rstrip("/")
-        self._http = httpx.Client(timeout=httpx.Timeout(120.0))
+        # Karvonen layer-1 ADD hook — the injection the model was trained with.
+        self._vectors_ref = [None]
+        register_karvonen_hook(
+            self.model, self._vectors_ref,
+            self.cfg.injection_token_id,
+            self.cfg.injection_left_neighbor_id,
+            self.cfg.injection_right_neighbor_id,
+        )
+        self._embed_device = self.model.get_input_embeddings().weight.device
 
         print(
             f"[NLAClient] {checkpoint_dir.name}: d_model={self.cfg.d_model} "
-            f"inj_scale={self.cfg.injection_scale} embed_scale={self.embed_scale:.2f} "
+            f"injection=Karvonen-ADD@layer1 device_map={device_map} "
             f"inj_char={self.cfg.injection_char!r}(id={self.cfg.injection_token_id})"
         )
 
     # ─── Core inference step ──────────────────────────────────────────────
 
-    def _build_embeds(
-        self, v_raw: torch.Tensor, prompt_content: str | None
-    ) -> tuple[np.ndarray, int]:
-        """Tokenize → embed → arch-scale → inject. Returns (embeds[T,d], prompt_len).
+    def _build_input_ids(self, prompt_content: str | None) -> torch.Tensor:
+        """Tokenize the actor prompt (with the injection marker). Returns [1, T].
 
-        prompt_content: user message content WITH <INJECT> placeholder. None
-        uses the sidecar's canonical actor template (recommended — that's
-        what the model was trained on).
+        prompt_content: user message WITH <INJECT> placeholder. None uses the
+        sidecar's canonical actor template (recommended — train distribution).
         """
         if prompt_content is None:
             content = self.cfg.actor_prompt_template.format(
@@ -390,65 +427,35 @@ class NLAClient:
             assert INJECT_PLACEHOLDER in prompt_content, (
                 f"custom prompt must contain {INJECT_PLACEHOLDER!r}"
             )
-            content = prompt_content.replace(
-                INJECT_PLACEHOLDER, self.cfg.injection_char
-            )
-
-        # One-step tokenize. Handles BOS correctly for all architectures —
-        # Gemma's chat template includes <bos>, Qwen has none. The two-step
-        # apply_chat_template(tokenize=False)→encode(add_special_tokens=False)
-        # is equivalent but add_special_tokens=True there would double-BOS
-        # Gemma (shifting every position by 1). Qwen has bos_token=None so
-        # it's a silent noop there, which makes this easy to miss.
-        input_ids = self.tokenizer.apply_chat_template(
+            content = prompt_content.replace(INJECT_PLACEHOLDER, self.cfg.injection_char)
+        enc = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": content}],
             tokenize=True, add_generation_prompt=True,
         )
-        ids_t = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
+        # transformers v5 returns a BatchEncoding (dict-like); v4 a list[int].
+        input_ids = enc["input_ids"] if hasattr(enc, "keys") else enc
+        return torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
 
-        with torch.no_grad():
-            # bf16 lookup → fp32 for injection math + numpy (no bf16 in numpy).
-            # embed_scale: 1.0 for Qwen/Llama, √d for Gemma-3.
-            embeds = (self.embed(ids_t.to(self.embed.weight.device))
-                      * self.embed_scale).float()
-
+    @torch.no_grad()
+    def _local_generate(self, v_raw: torch.Tensor, prompt_content: str | None,
+                        **sampling: object) -> str:
+        """Inject the RAW activation via the Karvonen layer-1 hook and decode."""
         assert torch.isfinite(v_raw).all(), "activation has NaN/Inf"
-        v_scaled = normalize_activation(
-            v_raw.float().view(1, -1), self.cfg.injection_scale
-        )
-
-        injected = inject_at_marked_positions(
-            ids_t, embeds.cpu(), v_scaled,
-            self.cfg.injection_token_id,
-            self.cfg.injection_left_neighbor_id,
-            self.cfg.injection_right_neighbor_id,
-        )
-        # SGLang wants [T, d] unbatched, contiguous for orjson's numpy path.
-        return injected[0].contiguous().numpy(), len(input_ids)
-
-    def _sglang_generate(
-        self, embeds_np: np.ndarray, **sampling: object
-    ) -> dict[str, Any]:
-        # DO NOT also send input_ids. With both present, SGLang may use
-        # input_ids for logprob bookkeeping while forwarding on input_embeds,
-        # causing misalignment. Embeds-only is safe.
-        #
-        # orjson.OPT_SERIALIZE_NUMPY reads the fp32 buffer directly — no
-        # 448K-Python-float intermediate from .tolist(). Matters at scale.
-        sp = {"temperature": 1.0, "max_new_tokens": 200,
-              "skip_special_tokens": False}
+        ids_t = self._build_input_ids(prompt_content).to(self._embed_device)
+        # vectors_ref carries the raw [1, d] vector; the hook norm-matches it
+        # onto the layer-1 residual at the marker. No injection_scale rescale.
+        self._vectors_ref[0] = v_raw.float().view(1, -1).to(self._embed_device)
+        sp = {"do_sample": True, "temperature": 1.0, "max_new_tokens": 200,
+              "top_p": 1.0, "top_k": 0, "repetition_penalty": 1.0,
+              "pad_token_id": self.tokenizer.eos_token_id}
         sp.update(sampling)
-        body = orjson.dumps(
-            {"input_embeds": embeds_np, "sampling_params": sp},
-            option=orjson.OPT_SERIALIZE_NUMPY,
-        )
-        resp = self._http.post(
-            f"{self.sglang_url}/generate",
-            content=body, headers={"Content-Type": "application/json"},
-        )
-        resp.raise_for_status()
-        out = resp.json()
-        return out[0] if isinstance(out, list) else out
+        try:
+            out = self.model.generate(
+                input_ids=ids_t, attention_mask=torch.ones_like(ids_t), **sp,
+            )
+        finally:
+            self._vectors_ref[0] = None
+        return self.tokenizer.decode(out[0, ids_t.shape[1]:], skip_special_tokens=True)
 
     # ─── Public API ───────────────────────────────────────────────────────
 
@@ -462,13 +469,13 @@ class NLAClient:
     ) -> str:
         """Decode one activation vector.
 
-        activation:  [d_model] raw vector — rescaled to cfg.injection_scale.
+        activation:  [d_model] raw vector — injected via Karvonen norm-match (raw, unscaled).
         prompt:      user-message content with <INJECT> marker. Default (None)
                      uses the sidecar's actor template — RECOMMENDED.
         extract_explanation:  strip <explanation> tags. False returns raw gen
                      (useful for debugging — if ALL outputs are CJK, or
                      describe a CJK char in English, injection likely failed).
-        sampling:    SGLang sampling_params (temperature, max_new_tokens, top_p, ...).
+        sampling:    HF generate() kwargs (temperature, max_new_tokens, top_p, ...).
 
         Known-noisy inputs (don't over-interpret poor decodes from these):
         - Early-sequence positions (first ~10 tokens): layer-K has seen few
@@ -483,9 +490,7 @@ class NLAClient:
             f"activation length {v.numel()} != d_model {self.cfg.d_model}"
         )
 
-        embeds_np, _ = self._build_embeds(v, prompt)
-        out = self._sglang_generate(embeds_np, **sampling)
-        text = out["text"]
+        text = self._local_generate(v, prompt, **sampling)
 
         if not extract_explanation:
             return text
@@ -506,8 +511,7 @@ class NLAClient:
         extract_explanation: bool = True,
         **sampling: object,
     ) -> list[str]:
-        """Sequential requests. SGLang's continuous batcher packs on its end.
-        For real throughput, fire these in parallel via async httpx."""
+        """Sequential local generations (one model.generate per vector)."""
         return [self.generate(v, prompt=prompt,
                               extract_explanation=extract_explanation,
                               **sampling)
@@ -674,8 +678,14 @@ def _main() -> None:
     import argparse
 
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("checkpoint", help="HF-format NLA actor dir (with nla_meta.yaml)")
-    ap.add_argument("--sglang-url", default="http://localhost:30000")
+    ap.add_argument("checkpoint", help="HF-format NLA actor dir (with nla_meta.yaml); "
+                    "a full model, or a LoRA adapter dir (then pass --base-ckpt)")
+    ap.add_argument("--base-ckpt", default=None,
+                    help="base model if `checkpoint` is a LoRA adapter dir")
+    ap.add_argument("--device-map", default="auto",
+                    help="'auto' (multi-GPU naive MP) or e.g. 'cuda:0'")
+    ap.add_argument("--experts-implementation", default=None,
+                    help="'eager' for Gemma-4 MoE on Blackwell/B200")
     ap.add_argument("--parquet", default=None,
                     help="Parquet with activation_vector column. Default: "
                          "smoke-test with one random vector.")
@@ -694,8 +704,11 @@ def _main() -> None:
 
     client = NLAClient(
         args.checkpoint,
-        sglang_url=args.sglang_url,
+        base_ckpt=args.base_ckpt,
+        device_map=args.device_map,
         injection_scale_override=args.injection_scale,
+        model_kwargs=({"experts_implementation": args.experts_implementation}
+                      if args.experts_implementation else None),
     )
 
     if args.parquet is None:
