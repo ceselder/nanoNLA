@@ -442,6 +442,9 @@ def main():
     p.add_argument("--base-ckpt", default="Qwen/Qwen3-8B",
                    help="Base the AV/AR LoRA adapters sit on (4-bit if --quant 4bit).")
     p.add_argument("--quant", choices=["none", "4bit"], default="4bit")
+    p.add_argument("--experts-implementation", default=None,
+                   help="MoE experts kernel (Gemma-4 etc.): 'eager' to avoid the "
+                        "fused torch._grouped_mm (sm_90-only) on Blackwell/B200.")
     p.add_argument("--device-map", choices=["single", "auto"], default="single")
     p.add_argument("--max-gpu-mem", type=int, default=0)
     p.add_argument("--rl-parquet", required=True)
@@ -572,6 +575,8 @@ def main():
     base = AutoModelForCausalLM.from_pretrained(
         args.base_ckpt, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
         quantization_config=quant_config, device_map=dmap, max_memory=max_mem,
+        **({"experts_implementation": args.experts_implementation}
+           if args.experts_implementation else {}),
     )
     if dmap is None:
         base = base.to(device)
@@ -654,6 +659,7 @@ def main():
         # Checkpoints record whether their backbone ran with the final RMSNorm
         # stripped (design §4) or kept (pre-2026-06 ckpts). Must match training.
         strip_final_norm=ar_meta.get("final_norm_stripped", False),
+        experts_implementation=args.experts_implementation,
     )
     if ar_dmap is None:
         critic = critic.to(device)
