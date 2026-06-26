@@ -27,7 +27,10 @@ SMOKE="${1:-}"
 if [ "$SMOKE" = "smoke" ]; then
   MAXROWS_REGEN="--max-rows 4000"; STEPS=60; WARMUP=5; SAVE=60; HELDOUT_ROWS=400; TAG=smoke
 else
-  MAXROWS_REGEN=""; STEPS=1000; WARMUP=50; SAVE=500; HELDOUT_ROWS=1000; TAG=v1
+  # ⚠️ DON'T FORGET THIS — TRAIN ON THE FULL THING. ~247k SFT rows at batch 16
+  # ≈ 15.5k steps/epoch; 15500 ≈ one full epoch (was 1000 = ~6.5%, which also
+  # floored the cosine LR early → undersold FVE). train_sft warns if <1 epoch.
+  MAXROWS_REGEN=""; STEPS=15500; WARMUP=200; SAVE=2500; HELDOUT_ROWS=1000; TAG=v2_fullep
 fi
 
 echo "===== [1/4] regen AV activations (Gemma layer $LAYER) ====="

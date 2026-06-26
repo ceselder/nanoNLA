@@ -488,6 +488,12 @@ def main():
     p.add_argument("--sidecar", default=None,
                    help="Sidecar source (defaults to --parquet for the dataset sidecar)")
     p.add_argument("--save-dir", required=True)
+    # ⚠️ DON'T FORGET THIS — TRAIN ON THE FULL THING. num_steps must cover at
+    # LEAST one epoch: num_steps * (batch_size * grad_accum) >= dataset rows.
+    # The warmstart datasets are ~247k rows → ~15.5k steps at batch 16. A
+    # carried-over small value (e.g. 1000) silently trains on a few % of the
+    # data AND lets the cosine LR floor early. The trainer prints a loud
+    # warning at startup if you're under one epoch — heed it.
     p.add_argument("--num-steps", type=int, default=1000)
     p.add_argument("--batch-size", type=int, default=64,
                    help="Per-forward batch (= 'micro batch'). Effective batch = "
@@ -762,6 +768,22 @@ def main():
     eff_batch = args.batch_size * grad_accum
     print(f"[loop] {args.num_steps} steps, batch={args.batch_size} × "
           f"grad_accum={grad_accum} = eff_batch={eff_batch}")
+
+    # ⚠️ DON'T FORGET THIS — TRAIN ON THE FULL THING. Warn loudly if num_steps
+    # doesn't cover at least one epoch of the loaded data; a too-small
+    # --num-steps trains on a fraction AND floors the cosine LR early.
+    steps_per_epoch = max(1, math.ceil(len(rows) / eff_batch))
+    epochs = args.num_steps / steps_per_epoch
+    if epochs < 1.0:
+        pct = 100.0 * args.num_steps / steps_per_epoch
+        print(f"[loop] ⚠️⚠️ WARNING: {args.num_steps} steps = only {pct:.1f}% of ONE "
+              f"epoch ({len(rows)} rows / eff_batch {eff_batch} = {steps_per_epoch} "
+              f"steps/epoch). You are NOT training on the full dataset. Set "
+              f"--num-steps >= {steps_per_epoch} to cover it. TRAIN ON THE FULL THING.",
+              flush=True)
+    else:
+        print(f"[loop] ~{epochs:.2f} epochs over {len(rows)} rows "
+              f"({steps_per_epoch} steps/epoch)", flush=True)
 
     for step in range(args.num_steps):
         t0 = time.time()

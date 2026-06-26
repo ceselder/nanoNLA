@@ -36,6 +36,18 @@
   `mse_scale`, `d_model` — all loaded from `nla_meta.yaml` and asserted
   against the live tokenizer at startup. Never hardcode them.
 
+## SFT: TRAIN ON THE FULL THING
+
+- **⚠️ DON'T FORGET THIS — warmstart SFT (AV and AR) must train on the FULL SFT
+  dataset, ≥1 epoch.** `num_steps × (batch_size × grad_accum)` must be ≥ the
+  dataset row count. The warmstart splits are ~247k rows → **~15.5k steps at
+  batch 16** for one epoch. Do NOT carry over a small `--num-steps` (e.g. 1000):
+  that trains on only a few percent of the data AND lets the cosine LR floor
+  early, badly underselling FVE. `nla/train_sft.py` prints a loud
+  `WARNING: ... only X% of ONE epoch` at startup if you're under one epoch —
+  heed it. (Learned the hard way on Gemma-4: 1000 steps gave AR FVE 48.4%;
+  retrained on the full epoch for the real number.)
+
 ## RL training: two trainers
 
 - The **verified recipe is single-GPU 4-bit** with HF `generate()` rollouts:
