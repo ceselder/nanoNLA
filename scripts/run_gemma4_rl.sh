@@ -44,7 +44,7 @@ $PY -m nla.train_rl_self_contained \
   --quant none --experts-implementation eager \
   --rl-parquet "$OUT/rl_gemma.parquet" --sidecar "$OUT/rl_gemma.parquet" \
   --save-dir "$CKPT/gemma4_rl_v1" \
-  --num-steps 500 --batch-prompts 24 --group-size 12 \
+  --num-steps 500 --batch-prompts 64 --group-size 8 \
   --max-new-tokens 150 --temperature 1.0 \
   --lr 1e-5 --kl-beta 0.01 --clip-eps 0.2 \
   --train-critic --critic-lr 5e-5 \

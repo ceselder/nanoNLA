@@ -42,6 +42,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from peft import (LoraConfig, PeftModel, get_peft_model,
                   inject_adapter_in_model, prepare_model_for_kbit_training)
@@ -430,10 +431,33 @@ def score_with_critic(
     return rewards
 
 
+def _allreduce_grads_(params, world):
+    """DP grad sync (ported from scripts/397b_av_sft_dp.py): flatten trainable
+    grads -> ONE cpu buffer -> gloo all_reduce(SUM) -> /world -> scatter back.
+
+    Mean-reducing each rank's per-rank-mean gradient is numerically identical to
+    computing the gradient over one world×-bigger batch (each rank holds an equal
+    share of samples). gloo/CPU avoids NCCL device-pinning fragility. Called once
+    per optim-step, AFTER all micro-batch backwards and BEFORE clip+step, so every
+    rank clips and steps on identical grads and weights never drift apart.
+    """
+    gs = [(p, p.grad) for p in params if p.grad is not None]
+    if not gs:
+        return
+    flat = torch.cat([g.detach().flatten().float().cpu() for _, g in gs])
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+    flat /= world
+    off = 0
+    for p, g in gs:
+        n = g.numel()
+        p.grad.copy_(flat[off:off + n].view_as(g).to(g.device))
+        off += n
+
+
 def grpo_update_microbatched(
     actor, optim, tokenizer, full_ids_list, prompt_lens, activations,
     old_logps_list, advantages, vectors_ref, device,
-    micro_batch=2, clip_eps=0.2, kl_beta=0.04, max_grad_norm=1.0,
+    micro_batch=2, clip_eps=0.2, kl_beta=0.04, max_grad_norm=1.0, grad_sync_fn=None,
 ):
     """Fused micro-batched forward+loss+backward for GRPO.
 
@@ -528,6 +552,10 @@ def grpo_update_microbatched(
         chunk_loss.backward()
         sample_losses_log.append(chunk_loss.item() * n / len(chunk_losses))
         del new_logp
+    # DP: average the actor LoRA grads across ranks before clip+step (no-op
+    # single-GPU). After this every rank has identical grads → identical step.
+    if grad_sync_fn is not None:
+        grad_sync_fn([p for p in actor.parameters() if p.requires_grad])
     grad_norm = torch.nn.utils.clip_grad_norm_(
         [p for p in actor.parameters() if p.requires_grad], max_grad_norm,
     )
@@ -646,7 +674,41 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    device = "cuda"
+    # ---- optional data parallelism (DDP) ----
+    # torchrun sets WORLD_SIZE/RANK/LOCAL_RANK. Each rank holds a FULL model
+    # replica on its own GPU and processes a disjoint stride-shard of the step's
+    # prompts; the LoRA + critic grads are gloo-all-reduced (mean) before each
+    # optim.step, so W ranks are numerically identical to one W×-bigger batch
+    # (GRPO advantages are per-prompt-group, hence local to each rank — sharding
+    # by prompt is exact). gloo/CPU all-reduce sidesteps NCCL device-pinning
+    # fragility on this box. Single-GPU (WORLD_SIZE unset) is completely untouched.
+    WORLD = int(os.environ.get("WORLD_SIZE", 1))
+    RANK = int(os.environ.get("RANK", 0))
+    LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
+    IS_MAIN = RANK == 0
+    DDP = WORLD > 1
+    if DDP:
+        torch.cuda.set_device(LOCAL_RANK)
+        device = f"cuda:{LOCAL_RANK}"
+        dist.init_process_group("gloo", rank=RANK, world_size=WORLD)
+        assert args.batch_prompts % WORLD == 0, (
+            f"--batch-prompts {args.batch_prompts} must be divisible by WORLD_SIZE "
+            f"{WORLD} so each rank gets an equal prompt shard (equal-share grad mean)."
+        )
+        print(f"[ddp] rank {RANK}/{WORLD} local={LOCAL_RANK} device={device} "
+              f"shard={args.batch_prompts // WORLD} prompts/step", flush=True)
+        # ⚠️ STAGGER the heavy model loads across ranks. N ranks each loading a
+        # full 26B (CPU-staging ~50GB + GPU transfer) SIMULTANEOUSLY storms the
+        # box's RAM + disk and can wedge it (locks out SSH; OOM). Serialize the
+        # load start by rank — one-time cost, paid once at startup. (Same lesson
+        # as the 397B "concurrent loads die → load sequentially".) Tunable via
+        # NLA_LOAD_STAGGER_S (seconds per rank; 0 disables).
+        _stag = float(os.environ.get("NLA_LOAD_STAGGER_S", "35"))
+        if LOCAL_RANK > 0 and _stag > 0:
+            print(f"[ddp] rank {RANK} staggering model load by {LOCAL_RANK * _stag:.0f}s", flush=True)
+            time.sleep(LOCAL_RANK * _stag)
+    else:
+        device = "cuda"
     os.environ.setdefault("HF_HOME", "/workspace-vast/pretrained_ckpts")
 
     # old_logp is computed from generate's RAW logits (output_logits). At
@@ -900,8 +962,8 @@ def main():
     trainable = [p for p in actor.parameters() if p.requires_grad]
     optim = _adam_cls(trainable, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0)
 
-    # ---- wandb ----
-    if not args.no_wandb:
+    # ---- wandb (rank 0 only under DDP) ----
+    if IS_MAIN and not args.no_wandb:
         wandb.init(project=args.wandb_project, name=args.wandb_name, config=vars(args))
 
     save_dir = Path(args.save_dir)
@@ -1017,6 +1079,12 @@ def main():
             cursor = 0
         batch_idxs = pending_idxs[cursor : cursor + args.batch_prompts]
         cursor += args.batch_prompts
+        # DP: all ranks compute the SAME global batch_idxs (same seed/shuffle),
+        # then each takes a disjoint stride-shard. Union over ranks = the full
+        # batch_prompts; grad all-reduce makes it one big batch. cursor advances
+        # by the GLOBAL batch on every rank, so they stay in lockstep.
+        if DDP:
+            batch_idxs = batch_idxs[RANK::WORLD]
 
         # ---- rollouts (ALWAYS batched across prompts — see rollout_batch) ----
         actor.eval()
@@ -1060,14 +1128,28 @@ def main():
         # ---- GRPO group-relative advantage (per-prompt mean & std) ----
         group_t = torch.tensor(all_prompt_group, dtype=torch.long, device=device)
         adv = torch.zeros_like(rewards_t)
-        for gi in range(args.batch_prompts):
+        _group_means = []
+        _group_stds = []
+        for gi in range(len(batch_idxs)):  # this rank's prompt groups (== batch_prompts single-GPU)
             mask = group_t == gi
             if mask.sum() == 0:
                 continue
             group_r = rewards_t[mask]
             mu = group_r.mean()
-            sd = group_r.std() if group_r.numel() > 1 else torch.tensor(1.0, device=device)
+            sd = group_r.std() if group_r.numel() > 1 else torch.tensor(0.0, device=device)
             adv[mask] = (group_r - mu) / (sd + 1e-6)
+            _group_means.append(mu)
+            _group_stds.append(sd)
+        # Reward-variance decomposition (this rank's shard): between-prompt ("data")
+        # variance = spread of the per-group means; within-group variance = mean of
+        # the per-group stds. GRPO's group baseline subtracts out the (large)
+        # between-prompt term and learns from the (smaller) within-group signal —
+        # which is why scaling prompts (B) matters more than group size (G).
+        _gm = torch.stack(_group_means) if len(_group_means) > 1 else torch.zeros(2, device=device)
+        between_group_std = _gm.std().item()
+        within_group_std = (
+            torch.stack(_group_stds).mean().item() if _group_stds else 0.0
+        )
 
         # ---- GRPO update: fused forward+loss+backward per micro-batch ----
         # Previous code did all forwards then all backwards, which retained
@@ -1082,18 +1164,30 @@ def main():
             micro_batch=args.logp_micro_batch,
             clip_eps=args.clip_eps, kl_beta=args.kl_beta,
             max_grad_norm=args.max_grad_norm,
+            # DP: mean-reduce the actor LoRA grads across ranks before clip+step.
+            grad_sync_fn=(lambda ps: _allreduce_grads_(ps, WORLD)) if DDP else None,
         )
         # Build a scalar-tensor stand-in for the existing logging path that
         # expects a `loss` tensor with .item().
         loss = torch.tensor(mean_loss_val, device=device)
         grad_norm = torch.tensor(grad_norm_val, device=device)
-        if not math.isfinite(mean_loss_val):
-            print(
-                f"step {step}: loss={mean_loss_val} non-finite "
-                f"(kl={grpo_metrics.get('kl_mean')}, "
-                f"clip_frac={grpo_metrics.get('clip_frac')}). Skipping critic update.",
-                flush=True,
-            )
+        # DP: ALL ranks must agree on skip-vs-continue, or the rank that
+        # continues hits the critic all-reduce alone and the run deadlocks.
+        finite_local = math.isfinite(mean_loss_val)
+        if DDP:
+            _ff = torch.tensor([1.0 if finite_local else 0.0])
+            dist.all_reduce(_ff, op=dist.ReduceOp.MIN)  # 0 if ANY rank non-finite
+            all_finite = _ff.item() > 0
+        else:
+            all_finite = finite_local
+        if not all_finite:
+            if IS_MAIN:
+                print(
+                    f"step {step}: loss={mean_loss_val} non-finite "
+                    f"(kl={grpo_metrics.get('kl_mean')}, "
+                    f"clip_frac={grpo_metrics.get('clip_frac')}). Skipping critic update.",
+                    flush=True,
+                )
             # The helper already refused to optim.step() on a non-finite grad
             # norm, so weights are intact; skip the critic update + logging.
             continue
@@ -1117,7 +1211,16 @@ def main():
                     continue
                 crit_inputs.append(torch.tensor(ids, dtype=torch.long))
                 crit_golds.append(act)
-            if crit_inputs:
+            # DP: co-train only when EVERY rank has inputs — otherwise an
+            # empty-input rank skips the critic grad all-reduce below and the
+            # others block on it forever. (With 256 samples/rank this ~never
+            # trips, but a latent deadlock days into a run is unacceptable.)
+            do_critic = 1 if crit_inputs else 0
+            if DDP:
+                _di = torch.tensor([float(do_critic)])
+                dist.all_reduce(_di, op=dist.ReduceOp.MIN)
+                do_critic = _di.item() > 0
+            if do_critic:
                 # Micro-batch the critic update — single forward on 256 sequences
                 # × 200 tokens × 5.5B-param critic with grad blows past 130GB.
                 # Accumulate gradient across micro-batches, single step at the
@@ -1147,12 +1250,22 @@ def main():
                     # Scale so the sum across micro-batches = MSE over full batch.
                     chunk_loss = F.mse_loss(pred_n, gold_n) * (bs / bs_total)
                     if not torch.isfinite(chunk_loss):
-                        print(f"step {step}: critic loss non-finite (chunk {cs}), skipping", flush=True)
+                        if IS_MAIN:
+                            print(f"step {step}: critic loss non-finite (chunk {cs}), skipping", flush=True)
                         finite = False
                         break
                     chunk_loss.backward()
                     accumulated += chunk_loss.item()
+                # DP: all ranks must agree on finite before the collective
+                # all-reduce + step (else a skipping rank deadlocks the rest).
+                if DDP:
+                    _cf = torch.tensor([1.0 if finite else 0.0])
+                    dist.all_reduce(_cf, op=dist.ReduceOp.MIN)
+                    finite = _cf.item() > 0
                 if finite:
+                    # DP: mean-reduce critic grads across ranks before clip+step.
+                    if DDP:
+                        _allreduce_grads_(critic_trainable, WORLD)
                     critic_grad_norm = torch.nn.utils.clip_grad_norm_(
                         critic_trainable, args.max_grad_norm,
                     )
@@ -1169,7 +1282,21 @@ def main():
         valid_rewards = [r for r in rewards if r is not None]
         n_valid = len(valid_rewards)
         n_total = len(rewards)
-        extraction_rate = n_valid / n_total if n_total else 0
+        # DP: reduce reward-sum + valid/total counts across ranks so reward_mean,
+        # FVE, and extraction_rate reflect the FULL global batch (the whole point
+        # of the bigger batch). ALL ranks must call this collective every step.
+        # reward_std/min/max stay this-rank's view (secondary monitoring only).
+        if DDP:
+            _rs = torch.tensor([float(sum(valid_rewards)), float(n_valid), float(n_total)])
+            dist.all_reduce(_rs, op=dist.ReduceOp.SUM)
+            _rsum, _nv, _nt = _rs.tolist()
+            reward_mean_g = (_rsum / _nv) if _nv else float("nan")
+            extraction_rate = (_nv / _nt) if _nt else 0
+            n_valid_g = int(_nv)
+        else:
+            reward_mean_g = float(np.mean(valid_rewards)) if valid_rewards else float("nan")
+            extraction_rate = n_valid / n_total if n_total else 0
+            n_valid_g = n_valid
         mean_cjk = (
             sum(cjk_fraction(t) for t in all_response_text) / max(len(all_response_text), 1)
         )
@@ -1181,14 +1308,14 @@ def main():
         # interpretable curve in wandb that maps to paper's reported numbers.
         # Use valid rewards only so extraction failures don't bias FVE down.
         fve = (
-            1.0 - (-float(np.mean(valid_rewards))) / fve_baseline
-            if valid_rewards else float("nan")
+            1.0 - (-reward_mean_g) / fve_baseline
+            if n_valid_g else float("nan")
         )
         log = {
             "step": step,
             "loss": loss.item(),
             "grad_norm": grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm),
-            "reward_mean": float(np.mean(valid_rewards)) if valid_rewards else float("nan"),
+            "reward_mean": reward_mean_g,
             "reward_std": float(np.std(valid_rewards)) if valid_rewards else float("nan"),
             "reward_min": float(np.min(valid_rewards)) if valid_rewards else float("nan"),
             "reward_max": float(np.max(valid_rewards)) if valid_rewards else float("nan"),
@@ -1199,11 +1326,14 @@ def main():
             # FVE under the old (pre-2026-06-09) meannorm baseline, for
             # comparing against historical wandb curves only.
             "fve_pct_meannorm": (
-                (1.0 - (-float(np.mean(valid_rewards))) / fve_baseline_meannorm) * 100.0
-                if valid_rewards else float("nan")
+                (1.0 - (-reward_mean_g) / fve_baseline_meannorm) * 100.0
+                if n_valid_g else float("nan")
             ),
             "advantage_mean": adv.mean().item(),
             "advantage_std": adv.std().item(),
+            "between_group_std": between_group_std,  # "data" var: spread of per-prompt means
+            "within_group_std": within_group_std,    # GRPO's actual learning signal
+
             "extraction_rate": extraction_rate,
             "mean_cjk": mean_cjk,
             "mean_resp_len": n_resps_t.mean().item(),
@@ -1219,19 +1349,20 @@ def main():
         crit_str = (
             f"| crit {critic_loss_val:.4f} " if args.train_critic else ""
         )
-        print(
-            f"step {step:04d} | loss {log['loss']:.4f} | r {log['reward_mean']:.3f} "
-            f"| FVE {log['fve_pct']:.1f}% {crit_str}| kl {log['kl_mean']:.4f} | "
-            f"clip {log['clip_frac']:.2%} | ext {extraction_rate:.0%} | "
-            f"t {log['wall_s']:.0f}s "
-            f"(roll {_t_roll:.0f} score {_t_score:.0f} upd {_t_upd:.0f})",
-            flush=True,
-        )
+        if IS_MAIN:
+            print(
+                f"step {step:04d} | loss {log['loss']:.4f} | r {log['reward_mean']:.3f} "
+                f"| FVE {log['fve_pct']:.1f}% {crit_str}| kl {log['kl_mean']:.4f} | "
+                f"clip {log['clip_frac']:.2%} | ext {extraction_rate:.0%} | "
+                f"t {log['wall_s']:.0f}s "
+                f"(roll {_t_roll:.0f} score {_t_score:.0f} upd {_t_upd:.0f})",
+                flush=True,
+            )
 
         # ---- per-step eval: every N steps, run actor (current weights) on a
         # FIXED set of held-out prompts and log explanations as a wandb Table.
         # Lets you scrub through the run and watch explanations evolve.
-        if args.eval_every > 0 and step % args.eval_every == 0:
+        if IS_MAIN and args.eval_every > 0 and step % args.eval_every == 0:
             actor.eval()
             eval_rewards_s = []
             eval_records = []
@@ -1370,11 +1501,11 @@ def main():
                     xname="step",
                 )
 
-        if not args.no_wandb:
+        if IS_MAIN and not args.no_wandb:
             wandb.log(log, step=step)
 
-        # ---- save LoRA periodically ----
-        if (step + 1) % args.save_every == 0:
+        # ---- save LoRA periodically (rank 0 only) ----
+        if IS_MAIN and (step + 1) % args.save_every == 0:
             out_dir = save_dir / f"iter_{step + 1:06d}"
             out_dir.mkdir(parents=True, exist_ok=True)
             # Critic FIRST: resume keys off the actor's adapter_config.json,
@@ -1393,10 +1524,16 @@ def main():
             actor.save_pretrained(str(out_dir))
             print(f"[save] LoRA → {out_dir}"
                   + (" (+ co-trained critic)" if args.train_critic else ""))
+        # DP: keep ranks in lockstep after rank-0's checkpoint I/O (barrier must
+        # be called by ALL ranks, so it lives OUTSIDE the IS_MAIN save gate).
+        if DDP:
+            dist.barrier()
 
     print("done.")
-    if not args.no_wandb:
+    if IS_MAIN and not args.no_wandb:
         wandb.finish()
+    if DDP:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
