@@ -663,10 +663,16 @@ def main():
     )
     if ar_dmap is None:
         critic = critic.to(device)
+    # Target the SAME modules AR-SFT did (lora_attention_targets), NOT the flat
+    # ar_meta list: on multimodal models (Gemma) the flat ["q_proj",...] suffix-
+    # matches a rogue Gemma4ClippableLinear *q_proj outside language_model that
+    # PEFT can't wrap, AND would mismatch the saved adapter keys. The scoped
+    # regex restricts to language_model attention — matching AR-SFT exactly.
+    from nla.arch_adapters import lora_attention_targets
     inject_adapter_in_model(LoraConfig(
         r=ar_meta["lora_r"], lora_alpha=ar_meta["lora_alpha"], lora_dropout=0.0,
         bias="none", task_type="CAUSAL_LM", use_rslora=True,
-        target_modules=ar_meta["target_modules"],
+        target_modules=lora_attention_targets(critic.backbone.config),
     ), critic.backbone)
     _ar_sd = _load_file(str(ar_src / "ar_lora_value_head.safetensors"))
     _miss, _unexp = critic.load_state_dict(_ar_sd, strict=False)
