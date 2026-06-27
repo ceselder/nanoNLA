@@ -249,6 +249,104 @@ def rollout_one_prompt(
     return responses
 
 
+@torch.no_grad()
+def rollout_batch(
+    actor, tokenizer, batch_rows, inject_char, vectors_ref,
+    inj_id, group_size, max_new_tokens, temperature, device,
+    eos_ids=None, chunk_size=96,
+):
+    """Generate `group_size` samples for EVERY prompt in `batch_rows`, batching
+    ACROSS prompts (and groups) into chunked generate() calls.
+
+    ⚠️ ALWAYS BATCH ROLLOUTS ACROSS PROMPTS — never loop one prompt at a time.
+    The actor prompt is a FIXED template (only the injected activation differs
+    per row), so all batch_prompts × group_size rollouts can share generate()
+    calls. Running them one-prompt-at-a-time (the old rollout_one_prompt loop)
+    left the GPU ~half-idle at batch=group_size and was the single biggest RL
+    step cost — 24 sequential 150-token autoregressive decodes per step. Here we
+    flatten (prompt × group) prompt-major into one list, left-pad each chunk to a
+    common length (a no-op when prompts are token-identical, which they are for
+    the AV template), set vectors_ref to the per-row activations — the inject
+    hook matches the N marker sites to the N vectors in row-major order, one
+    marker per row — and run `chunk_size` sequences per generate() call.
+
+    Returns a flat list of per-sample dicts (same fields the old per-prompt path
+    produced, plus "group" = prompt index and "activation"), order = prompt-major.
+    """
+    if eos_ids is None:
+        eos_ids = {tokenizer.eos_token_id}
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+
+    # Flatten prompt-major: prompt gi contributes group_size consecutive rows.
+    flat = []  # list of (group_idx, prompt_ids:list[int], activation:tensor[d])
+    for gi, row in enumerate(batch_rows):
+        ptext = build_prompt_text(row["prompt"], inject_char, tokenizer)
+        pids = tokenizer.encode(ptext, add_special_tokens=False)
+        act = torch.tensor(row["activation"], dtype=torch.float32)
+        for _ in range(group_size):
+            flat.append((gi, pids, act))
+
+    out = []
+    for cs in range(0, len(flat), chunk_size):
+        chunk = flat[cs : cs + chunk_size]
+        c = len(chunk)
+        maxlen = max(len(pids) for _, pids, _ in chunk)
+        # LEFT-pad (decoder-only generate must be left-padded so every row's
+        # generation starts at the same column `maxlen`).
+        ids = torch.full((c, maxlen), pad_id, dtype=torch.long, device=device)
+        attn = torch.zeros((c, maxlen), dtype=torch.long, device=device)
+        for i, (_, pids, _) in enumerate(chunk):
+            L = len(pids)
+            ids[i, maxlen - L:] = torch.tensor(pids, dtype=torch.long, device=device)
+            attn[i, maxlen - L:] = 1
+        # One activation per row; row-major order matches the hook's row-major
+        # marker scan (each row has exactly one marker).
+        v_batch = torch.stack([a for _, _, a in chunk]).to(device).float()  # [c, d]
+        vectors_ref[0] = v_batch
+        try:
+            gen_out = actor.generate(
+                input_ids=ids, attention_mask=attn,
+                max_new_tokens=max_new_tokens, do_sample=True, temperature=temperature,
+                top_p=1.0, top_k=0, repetition_penalty=1.0,  # see rollout_one_prompt
+                pad_token_id=pad_id,
+                return_dict_in_generate=True, output_logits=True,  # RAW logits
+            )
+        finally:
+            vectors_ref[0] = None
+        seqs = gen_out.sequences  # [c, maxlen + new]
+        scores = gen_out.logits   # tuple(new) of [c, V] RAW logits
+        for i, (gidx, pids, act) in enumerate(chunk):
+            resp_ids = seqs[i, maxlen:].tolist()
+            n_real = next(
+                (j + 1 for j, t in enumerate(resp_ids) if t in eos_ids),
+                len(resp_ids),
+            )
+            resp_ids = resp_ids[:n_real]
+            text = tokenizer.decode(resp_ids, skip_special_tokens=True)
+            old_logp = []
+            for t, step_logits in enumerate(scores):
+                if t >= n_real:
+                    break
+                lp = F.log_softmax(step_logits[i].float(), dim=-1)
+                old_logp.append(lp[resp_ids[t]].item())
+            # full_ids = real (unpadded) prompt + the n_real response tokens —
+            # identical layout to the old per-prompt path (no left-pad leaks
+            # downstream; grpo re-pads to its own max_len).
+            full_ids = torch.tensor(pids + resp_ids[: len(old_logp)], dtype=torch.long)
+            out.append({
+                "group": gidx,
+                "text": text,
+                "full_ids": full_ids,
+                "prompt_len": len(pids),
+                "old_logp": torch.tensor(old_logp, dtype=torch.float32),
+                "n_resp": len(old_logp),
+                "activation": act,
+            })
+    return out
+
+
 def critic_predict(critic, input_ids, attention_mask, mse_scale_f):
     """Forward the critic and produce a per-sample prediction vector.
 
@@ -288,29 +386,47 @@ def critic_predict(critic, input_ids, attention_mask, mse_scale_f):
 
 def score_with_critic(
     critic, tokenizer, explanations, activations, template, mse_scale_f, device,
+    chunk_size=64,
 ):
-    """Returns list of rewards (None for failed extractions)."""
-    rewards = []
-    for expl, act in zip(explanations, activations):
+    """Returns list of rewards (None for failed extractions).
+
+    ⚠️ ALWAYS BATCH the critic forward — never score one explanation at a time.
+    The critic prompt is RIGHT-padded (critic_predict extracts at the last
+    non-pad token = attention_mask.sum()-1 = the `<summary>` suffix, so pads on
+    the right don't shift the anchor), letting one forward score `chunk_size`
+    explanations. Per-element math is identical to the old per-sample path.
+    None reward (= failed extraction / over-length) is filled to -2.0 upstream.
+    """
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    rewards = [None] * len(explanations)
+    # Encode all valid (non-None, <=1024 tok) explanations, keep their indices.
+    enc = []  # (orig_idx, ids)
+    for i, expl in enumerate(explanations):
         if expl is None:
-            rewards.append(None)
             continue
-        text = template.format(explanation=expl)
-        ids = tokenizer.encode(text, add_special_tokens=False)
+        ids = tokenizer.encode(template.format(explanation=expl), add_special_tokens=False)
         if len(ids) > 1024:
-            rewards.append(None)
-            continue
-        x = torch.tensor([ids], dtype=torch.long, device=device)
+            continue  # leaves rewards[i] = None
+        enc.append((i, ids))
+
+    for cs in range(0, len(enc), chunk_size):
+        chunk = enc[cs : cs + chunk_size]
+        bs = len(chunk)
+        maxlen = max(len(ids) for _, ids in chunk)
+        x = torch.full((bs, maxlen), pad_id, dtype=torch.long, device=device)
+        attn = torch.zeros((bs, maxlen), dtype=torch.long, device=device)
+        for j, (_, ids) in enumerate(chunk):
+            x[j, : len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)  # RIGHT-pad
+            attn[j, : len(ids)] = 1
         with torch.no_grad():
-            pred = critic_predict(critic, x, None, mse_scale_f)[0]  # [d]
-        gold = act.to(device).float()
-        pred_n = normalize_activation(pred.unsqueeze(0), mse_scale_f)[0]
-        gold_n = normalize_activation(gold.unsqueeze(0), mse_scale_f)[0]
-        mse = F.mse_loss(pred_n, gold_n).item()
-        if not math.isfinite(mse):
-            rewards.append(None)
-            continue
-        rewards.append(-mse)
+            preds = critic_predict(critic, x, attn, mse_scale_f)  # [bs, d]
+        pred_n = normalize_activation(preds, mse_scale_f)  # [bs, d]
+        for j, (i, _) in enumerate(chunk):
+            gold_n = normalize_activation(activations[i].to(device).float().unsqueeze(0), mse_scale_f)[0]
+            mse = F.mse_loss(pred_n[j], gold_n).item()
+            rewards[i] = (-mse) if math.isfinite(mse) else None
     return rewards
 
 
@@ -478,6 +594,14 @@ def main():
                    help="Micro-batch size for the critic's training-time forward. "
                         "Single full-batch forward OOMs at B*G=256.")
     p.add_argument("--logp-micro-batch", type=int, default=2)
+    p.add_argument("--rollout-chunk", type=int, default=96,
+                   help="Sequences per BATCHED rollout generate() call. The "
+                        "rollout always batches across prompts (see rollout_batch); "
+                        "this just caps per-call memory (output_logits is "
+                        "chunk×new_tokens×vocab). batch_prompts×group_size rollouts "
+                        "run in ceil(B*G/chunk) calls instead of B sequential calls.")
+    p.add_argument("--score-chunk", type=int, default=64,
+                   help="Explanations per BATCHED critic-scoring forward.")
     p.add_argument("--save-every", type=int, default=50)
     p.add_argument("--resume-from-lora", type=str, default=None,
                    help="Directory containing a saved LoRA adapter (iter_NNNNNN); "
@@ -894,7 +1018,7 @@ def main():
         batch_idxs = pending_idxs[cursor : cursor + args.batch_prompts]
         cursor += args.batch_prompts
 
-        # ---- rollouts ----
+        # ---- rollouts (ALWAYS batched across prompts — see rollout_batch) ----
         actor.eval()
         all_full_ids = []
         all_prompt_lens = []
@@ -903,30 +1027,30 @@ def main():
         all_response_text = []
         all_prompt_group = []
         all_old_logps = []  # 1-D tensor per sample
-        for gi, row_idx in enumerate(batch_idxs):
-            row = rows[row_idx]
-            prompt_text = build_prompt_text(row["prompt"], inject_char, tokenizer)
-            activation = torch.tensor(row["activation"], dtype=torch.float32)
-            responses = rollout_one_prompt(
-                actor, tokenizer, prompt_text, activation, vectors_ref,
-                inj_id, args.group_size, args.max_new_tokens, args.temperature, device,
-                eos_ids=eos_ids,
-            )
-            for r in responses:
-                expl = extract_explanation(r["text"])
-                all_full_ids.append(r["full_ids"])
-                all_prompt_lens.append(r["prompt_len"])
-                all_activations.append(activation)
-                all_explanations.append(expl)
-                all_response_text.append(r["text"])
-                all_prompt_group.append(gi)
-                all_old_logps.append(r["old_logp"].to(device))
+        _t_roll = time.time()
+        batch_rows = [rows[ri] for ri in batch_idxs]
+        samples = rollout_batch(
+            actor, tokenizer, batch_rows, inject_char, vectors_ref,
+            inj_id, args.group_size, args.max_new_tokens, args.temperature, device,
+            eos_ids=eos_ids, chunk_size=args.rollout_chunk,
+        )
+        for s in samples:
+            all_full_ids.append(s["full_ids"])
+            all_prompt_lens.append(s["prompt_len"])
+            all_activations.append(s["activation"])
+            all_explanations.append(extract_explanation(s["text"]))
+            all_response_text.append(s["text"])
+            all_prompt_group.append(s["group"])
+            all_old_logps.append(s["old_logp"].to(device))
+        _t_roll = time.time() - _t_roll
 
-        # ---- scoring ----
+        # ---- scoring (ALWAYS batched — see score_with_critic) ----
+        _t_score = time.time()
         rewards = score_with_critic(
             critic, tokenizer, all_explanations, all_activations,
-            template, mse_scale_f, device,
+            template, mse_scale_f, device, chunk_size=args.score_chunk,
         )
+        _t_score = time.time() - _t_score
         # Paper's FAILED_EXTRACTION_REWARD = -2.0 (nla/reward.py): MSE on
         # fully-orthogonal unit vectors is 2.0, so this is the "worst possible"
         # critic outcome. Same penalty as a fully wrong direction.
@@ -950,6 +1074,7 @@ def main():
         # every micro-batch's compute graph and OOM'd at B*G=256. The fused
         # version releases each chunk's graph before starting the next.
         actor.train()
+        _t_upd = time.time()
         mean_loss_val, grad_norm_val, grpo_metrics = grpo_update_microbatched(
             actor, optim, tokenizer,
             all_full_ids, all_prompt_lens, all_activations,
@@ -1038,6 +1163,7 @@ def main():
                         if hasattr(critic_grad_norm, "item")
                         else float(critic_grad_norm)
                     )
+        _t_upd = time.time() - _t_upd
 
         # ---- logging ----
         valid_rewards = [r for r in rewards if r is not None]
@@ -1086,6 +1212,9 @@ def main():
             "critic_loss": critic_loss_val,
             "critic_grad_norm": critic_grad_norm_val,
             "wall_s": time.time() - t0,
+            "rollout_s": _t_roll,
+            "score_s": _t_score,
+            "update_s": _t_upd,
         }
         crit_str = (
             f"| crit {critic_loss_val:.4f} " if args.train_critic else ""
@@ -1094,7 +1223,8 @@ def main():
             f"step {step:04d} | loss {log['loss']:.4f} | r {log['reward_mean']:.3f} "
             f"| FVE {log['fve_pct']:.1f}% {crit_str}| kl {log['kl_mean']:.4f} | "
             f"clip {log['clip_frac']:.2%} | ext {extraction_rate:.0%} | "
-            f"t {log['wall_s']:.0f}s",
+            f"t {log['wall_s']:.0f}s "
+            f"(roll {_t_roll:.0f} score {_t_score:.0f} upd {_t_upd:.0f})",
             flush=True,
         )
 

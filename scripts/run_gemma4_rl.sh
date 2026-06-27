@@ -48,7 +48,9 @@ $PY -m nla.train_rl_self_contained \
   --max-new-tokens 150 --temperature 1.0 \
   --lr 1e-5 --kl-beta 0.01 --clip-eps 0.2 \
   --train-critic --critic-lr 5e-5 \
-  --logp-micro-batch 2 --max-rows 30000 \
+  --logp-micro-batch 4 --critic-micro-batch 8 \
+  --rollout-chunk 96 --score-chunk 64 \
+  --max-rows 30000 \
   --save-every 50 --eval-every 10 --eval-n-prompts 20 --eval-skip-rows 35000 \
   --max-grad-norm 1.0 \
   --wandb-project nla-gemma4-26b --wandb-name gemma4_rl_v1 --seed 0
