@@ -19,8 +19,12 @@ CHAR="㊗"
 SLIM=/workspace/gemma-nla/qwen_slim
 OUT=/workspace/gemma-nla/data
 CKPT=/workspace/gemma-nla/ckpts
-AV=$CKPT/gemma4_av_sft_v1/iter_0001000
-AR=$CKPT/gemma4_ar_sft_v1/iter_0001000
+# Use the v2 full-epoch warmstarts (latest iter_* in each dir). AV-SFT v2 loss
+# ~1.5; AR-SFT v2 held-out FVE 58.1% (vs v1's 48.4%).
+AV=$(ls -d $CKPT/gemma4_av_sft_v2_fullep/iter_* 2>/dev/null | sort | tail -1)
+AR=$(ls -d $CKPT/gemma4_ar_sft_v2_fullep/iter_* 2>/dev/null | sort | tail -1)
+[ -z "$AV" ] || [ -z "$AR" ] && { echo "missing v2 AV/AR checkpoint (AV=$AV AR=$AR)"; exit 1; }
+echo "[rl] AV=$AV"; echo "[rl] AR=$AR"
 
 echo "===== [1/2] regen RL-split activations (Gemma layer $LAYER, ~40k slice) ====="
 # mode=ar: no 'response' column needed (rl_shuf has none) and the sidecar gets
