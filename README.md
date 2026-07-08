@@ -4,6 +4,13 @@
 
 (enjoy gpt image 2.0 reading of this repo)
 
+# ⚠️ Superseded by easyNLA
+
+This repo has been succeeded by **[easyNLA](https://github.com/asherps/EasyNLA) by [Asher](https://github.com/asherps)**,
+who maintains a minimal implementation with sane defaults, best practices and pain-free integration with **[VLLM-Lens](https://www.lesswrong.com/posts/3bs27nZQuEcKhXf7q/vllm-lens-fast-interpretability-tooling-that-scales-to)**, which natively supports activation injection and **significantly speeds up training**
+
+nanoNLA remains available as a ~minimal reference, and for archival purposes. Please use Asher's repo instead. My [warmstart data](https://huggingface.co/datasets/ceselder/qwen3-8b-nla-L24-finefineweb-100k) is still good though
+
 # What is this?
 
 This is a minimal reimplementation of [Natural Language Autoencoders Produce Unsupervised Explanations of LLM Activations](https://transformer-circuits.pub/2026/nla/index.html).
